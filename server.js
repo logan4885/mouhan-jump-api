@@ -24,6 +24,7 @@ const BLOCK_IDS = ['candy', 'neon'];
 const SKIN_KEYS = new Set([...CAN_IDS.map((i) => 'player:' + i), ...BLOCK_IDS.map((i) => 'block:' + i)]);
 const MAX_SCORE = 20000;           // 单人最高分上限，超出一律拒绝
 const AVATARS = ['🐯', '🦊', '🐱', '🐼', '🐸', '🐵', '🐰', '🐻', '🦁', '🐨', '🐙', '🦄', '🐧', '🐶'];
+const PICK_AVATARS = [...AVATARS, '🦒', '🐘', '🐢', '🦉', '🐬', '🐳', '🦋', '🐝', '🐞', '🦖'];   // 玩家可自选的头像（白名单）
 const COLORS = ['#ffb347', '#ff8a65', '#84b6f4', '#ffc4dd', '#ff6f61', '#8fe3df', '#c3a6ff', '#7fdc8f', '#ffe680'];
 
 const pool = mysql.createPool({
@@ -52,6 +53,9 @@ async function initDb() {
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_score (best_score)
   ) DEFAULT CHARSET=utf8mb4`);
+  // 头像（玩家自选的动物 emoji）：老库补一列，已存在则忽略
+  try { await pool.query('ALTER TABLE players ADD COLUMN avatar VARCHAR(8) NULL'); }
+  catch (e) { if (!(e.errno === 1060 || /duplicate column/i.test(e.message))) throw e; }
   // 第三方账号 -> 玩家（只存服务商给的用户标识，不存邮箱、不存密码）
   await pool.query(`CREATE TABLE IF NOT EXISTS accounts (
     provider VARCHAR(12) NOT NULL,
@@ -89,9 +93,10 @@ function cleanSkins(list) {
   return [...set];
 }
 
-function look(id) {                // 用玩家 ID 决定头像表情和底色，保持稳定
+function look(id, chosen) {        // 默认用玩家 ID 决定头像和底色（稳定随机）；玩家选过就用自己选的
   const n = parseInt(id.slice(0, 8), 16);
-  return { avatar: AVATARS[n % AVATARS.length], color: COLORS[(n >> 4) % COLORS.length] };
+  const avatar = PICK_AVATARS.includes(chosen) ? chosen : AVATARS[n % AVATARS.length];
+  return { avatar, color: COLORS[(n >>> 4) % COLORS.length] };
 }
 
 const isVip = (unlocked) => (unlocked ? String(unlocked).split(',') : []).some((k) => k.startsWith('player:') && !FREE_CANS.includes(k.slice(7)));
@@ -101,7 +106,7 @@ function publicPlayer(r, rank) {
     vip: isVip(r.unlocked),
     id: r.id, nickname: r.nickname, score: r.best_score, perfects: r.perfects, games: r.games,
     equipped: r.equipped, unlocked: r.unlocked ? r.unlocked.split(',') : [],
-    total: CAN_IDS.length, ...look(r.id), ...(rank ? { rank } : {}),
+    total: CAN_IDS.length, ...look(r.id, r.avatar), ...(rank ? { rank } : {}),
   };
 }
 
@@ -241,24 +246,25 @@ async function handleSync(req, res, cors) {
   const unlocked = cleanSkins(b.unlocked);
   const equipped = unlocked.includes(b.equipped) && String(b.equipped).startsWith('player:') ? b.equipped : 'player:cola';
   const nickname = cleanNick(b.nickname, b.id);
+  const avatar = PICK_AVATARS.includes(b.avatar) ? b.avatar : null;   // 没选/不合法就不改动
   const hash = sha256(b.secret);
 
   const [rows] = await pool.query('SELECT secret_hash, unlocked FROM players WHERE id = ?', [b.id]);
   if (!rows.length) {
     await pool.query(
-      'INSERT INTO players (id, secret_hash, nickname, best_score, perfects, games, equipped, unlocked) VALUES (?,?,?,?,?,?,?,?)',
-      [b.id, hash, nickname, score, perfects, games, equipped, unlocked.join(',')]);
+      'INSERT INTO players (id, secret_hash, nickname, avatar, best_score, perfects, games, equipped, unlocked) VALUES (?,?,?,?,?,?,?,?,?)',
+      [b.id, hash, nickname, avatar, score, perfects, games, equipped, unlocked.join(',')]);
   } else {
     const r = rows[0];
     if (!(await secretMatches(r.secret_hash, b.id, hash))) return send(res, 403, { ok: false, error: 'forbidden' }, cors);
     // 分数、完美数、局数只增不减；已解锁的皮肤也只增不减
     const merged = cleanSkins([...(r.unlocked ? r.unlocked.split(',') : []), ...unlocked]);
     await pool.query(
-      'UPDATE players SET nickname=?, best_score=GREATEST(best_score,?), perfects=GREATEST(perfects,?), games=GREATEST(games,?), equipped=?, unlocked=? WHERE id=?',
-      [nickname, score, perfects, games, equipped, merged.join(','), b.id]);
+      'UPDATE players SET nickname=?, avatar=COALESCE(?, avatar), best_score=GREATEST(best_score,?), perfects=GREATEST(perfects,?), games=GREATEST(games,?), equipped=?, unlocked=? WHERE id=?',
+      [nickname, avatar, score, perfects, games, equipped, merged.join(','), b.id]);
   }
-  const [[me]] = await pool.query('SELECT best_score FROM players WHERE id = ?', [b.id]);
-  send(res, 200, { ok: true, rank: await rankOf(me.best_score), score: me.best_score }, cors);
+  const [[me]] = await pool.query('SELECT best_score, avatar FROM players WHERE id = ?', [b.id]);
+  send(res, 200, { ok: true, rank: await rankOf(me.best_score), score: me.best_score, avatar: look(b.id, me.avatar).avatar }, cors);
 }
 
 async function route(req, res) {
@@ -286,8 +292,8 @@ async function route(req, res) {
   if (req.method === 'GET' && path === '/api/leaderboard/top') {
     const limit = Math.max(1, Math.min(50, parseInt(url.searchParams.get('limit'), 10) || 10));
     const [rows] = await pool.query(
-      'SELECT id, nickname, best_score, equipped, unlocked FROM players WHERE best_score > 0 ORDER BY best_score DESC, updated_at ASC LIMIT ?', [limit]);
-    return send(res, 200, rows.map((r) => ({ id: r.id, nickname: r.nickname, score: r.best_score, equipped: r.equipped, vip: isVip(r.unlocked), ...look(r.id) })),
+      'SELECT id, nickname, avatar, best_score, equipped, unlocked FROM players WHERE best_score > 0 ORDER BY best_score DESC, updated_at ASC LIMIT ?', [limit]);
+    return send(res, 200, rows.map((r) => ({ id: r.id, nickname: r.nickname, score: r.best_score, equipped: r.equipped, vip: isVip(r.unlocked), ...look(r.id, r.avatar) })),
       { ...cors, 'Cache-Control': 'public, max-age=5' });
   }
   const m = path.match(/^\/api\/player\/([^/]+)$/);
