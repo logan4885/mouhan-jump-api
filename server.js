@@ -73,8 +73,11 @@ function look(id) {                // 用玩家 ID 决定头像表情和底色�
   return { avatar: AVATARS[n % AVATARS.length], color: COLORS[(n >> 4) % COLORS.length] };
 }
 
+const isVip = (unlocked) => (unlocked ? String(unlocked).split(',') : []).some((k) => k.startsWith('player:') && !FREE_CANS.includes(k.slice(7)));
+
 function publicPlayer(r, rank) {
   return {
+    vip: isVip(r.unlocked),
     id: r.id, nickname: r.nickname, score: r.best_score, perfects: r.perfects, games: r.games,
     equipped: r.equipped, unlocked: r.unlocked ? r.unlocked.split(',') : [],
     total: CAN_IDS.length, ...look(r.id), ...(rank ? { rank } : {}),
@@ -176,8 +179,8 @@ async function route(req, res) {
   if (req.method === 'GET' && path === '/api/leaderboard/top') {
     const limit = Math.max(1, Math.min(50, parseInt(url.searchParams.get('limit'), 10) || 10));
     const [rows] = await pool.query(
-      'SELECT id, nickname, best_score, equipped FROM players WHERE best_score > 0 ORDER BY best_score DESC, updated_at ASC LIMIT ?', [limit]);
-    return send(res, 200, rows.map((r) => ({ id: r.id, nickname: r.nickname, score: r.best_score, equipped: r.equipped, ...look(r.id) })),
+      'SELECT id, nickname, best_score, equipped, unlocked FROM players WHERE best_score > 0 ORDER BY best_score DESC, updated_at ASC LIMIT ?', [limit]);
+    return send(res, 200, rows.map((r) => ({ id: r.id, nickname: r.nickname, score: r.best_score, equipped: r.equipped, vip: isVip(r.unlocked), ...look(r.id) })),
       { ...cors, 'Cache-Control': 'public, max-age=5' });
   }
   const m = path.match(/^\/api\/player\/([^/]+)$/);
@@ -185,7 +188,8 @@ async function route(req, res) {
     if (!isHex32(m[1])) return send(res, 400, { ok: false, error: 'bad_id' }, cors);
     const [rows] = await pool.query('SELECT * FROM players WHERE id = ?', [m[1]]);
     if (!rows.length) return send(res, 404, { ok: false, error: 'not_found' }, cors);
-    return send(res, 200, { ok: true, player: publicPlayer(rows[0], await rankOf(rows[0].best_score)) }, cors);
+    const [[cnt]] = await pool.query('SELECT COUNT(*) AS c FROM players WHERE best_score > 0');
+    return send(res, 200, { ok: true, player: { ...publicPlayer(rows[0], await rankOf(rows[0].best_score)), totalPlayers: cnt.c } }, cors);
   }
   send(res, 404, { ok: false, error: 'not_found' }, cors);
 }
