@@ -24,7 +24,8 @@ const BLOCK_IDS = ['candy', 'neon'];
 const SKIN_KEYS = new Set([...CAN_IDS.map((i) => 'player:' + i), ...BLOCK_IDS.map((i) => 'block:' + i)]);
 const MAX_SCORE = 20000;           // 单人最高分上限，超出一律拒绝
 const AVATARS = ['🐯', '🦊', '🐱', '🐼', '🐸', '🐵', '🐰', '🐻', '🦁', '🐨', '🐙', '🦄', '🐧', '🐶'];
-const PICK_AVATARS = [...AVATARS, '🦒', '🐘', '🐢', '🦉', '🐬', '🐳', '🦋', '🐝', '🐞', '🦖'];   // 玩家可自选的头像（白名单）
+const PICK_AVATARS = [...AVATARS, '🦒', '🐘', '🐢', '🦉', '🐬', '🐳', '🦋', '🐝', '🐞', '🦖',
+  '🐷', '🐮', '🐹', '🐭', '🐔', '🐤', '🦆', '🦅', '🦇', '🐺', '🐗', '🐴', '🐍', '🦎', '🐊', '🐟', '🐠', '🦈', '🦀', '🦞', '🐌', '🦓', '🦘', '🦔', '🦜', '🦚'];   // 玩家可自选的头像（白名单）
 const COLORS = ['#ffb347', '#ff8a65', '#84b6f4', '#ffc4dd', '#ff6f61', '#8fe3df', '#c3a6ff', '#7fdc8f', '#ffe680'];
 
 const pool = mysql.createPool({
