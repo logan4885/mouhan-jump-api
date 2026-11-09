@@ -291,9 +291,10 @@ async function route(req, res) {
     return handleDelete(req, res, cors);
   }
   if (req.method === 'GET' && path === '/api/leaderboard/top') {
-    const limit = Math.max(1, Math.min(50, parseInt(url.searchParams.get('limit'), 10) || 10));
+    const limit = Math.max(1, Math.min(100, parseInt(url.searchParams.get('limit'), 10) || 10));
+    const offset = Math.max(0, Math.min(1000000, parseInt(url.searchParams.get('offset'), 10) || 0));   // 分页：往下滑动继续加载，直到看完所有人
     const [rows] = await pool.query(
-      'SELECT id, nickname, avatar, best_score, equipped, unlocked FROM players WHERE best_score > 0 ORDER BY best_score DESC, updated_at ASC LIMIT ?', [limit]);
+      'SELECT id, nickname, avatar, best_score, equipped, unlocked FROM players WHERE best_score > 0 ORDER BY best_score DESC, updated_at ASC, id ASC LIMIT ? OFFSET ?', [limit, offset]);
     return send(res, 200, rows.map((r) => ({ id: r.id, nickname: r.nickname, score: r.best_score, equipped: r.equipped, vip: isVip(r.unlocked), ...look(r.id, r.avatar) })),
       { ...cors, 'Cache-Control': 'public, max-age=5' });
   }
