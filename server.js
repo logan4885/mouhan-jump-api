@@ -18,7 +18,7 @@ const ALLOWED = (process.env.ALLOWED_ORIGINS || 'https://jump.mouhan.dev,https:/
   .split(',').map((s) => s.trim()).filter(Boolean);
 
 /* ---------- 数据校验用的白名单（和前端 canSkins.js / SkinManager.js 保持一致） ---------- */
-const CAN_IDS = ['cola', 'lemon', 'blue', 'orange', 'gold', 'chrome', 'holo', 'neon', 'galaxy', 'blaze', 'frost', 'crystal', 'pixel', 'thunder'];
+const CAN_IDS = ['cola', 'lemon', 'blue', 'orange', 'gold', 'chrome', 'holo', 'neon', 'galaxy', 'blaze', 'frost', 'crystal', 'pixel', 'thunder', 'chrono'];
 const FREE_CANS = ['cola', 'lemon', 'blue', 'orange'];
 const BLOCK_IDS = ['candy', 'neon'];
 const SKIN_KEYS = new Set([...CAN_IDS.map((i) => 'player:' + i), ...BLOCK_IDS.map((i) => 'block:' + i)]);
