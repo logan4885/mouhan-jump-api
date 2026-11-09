@@ -1,0 +1,12 @@
+{
+  "name": "jump3d-server",
+  "version": "1.0.0",
+  "description": "跳一跳 3D 排行榜后端（Express + MySQL）",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "mysql2": "^3.11.0"
+  }
+}
