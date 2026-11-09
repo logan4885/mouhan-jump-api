@@ -4,11 +4,16 @@
 //   GET  /api/leaderboard/top 前 N 名（带头像、正在使用的皮肤）
 //   GET  /api/player/:id      某个玩家的详情（已解锁皮肤 + 正在使用）
 //   GET  /api/health          健康检查
+//   POST /api/auth/login      用 Google / Facebook 登录：把本机玩家绑定到账号，或在新设备上取回账号的进度
+//   POST /api/account/delete  删除我的全部数据（玩家 + 绑定的账号）
+// 环境变量：GOOGLE_CLIENT_ID（Google OAuth 客户端 ID）、FB_APP_ID（Facebook 应用 ID）
 const crypto = require('crypto');
 const http = require('http');
 const mysql = require('mysql2/promise');
 
 const PORT = Number(process.env.PORT) || 3000;
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const FB_APP_ID = process.env.FB_APP_ID || '';
 const ALLOWED = (process.env.ALLOWED_ORIGINS || 'https://jump.mouhan.dev,https://mouhan.dev')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -46,6 +51,22 @@ async function initDb() {
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_score (best_score)
+  ) DEFAULT CHARSET=utf8mb4`);
+  // 第三方账号 -> 玩家（只存服务商给的用户标识，不存邮箱、不存密码）
+  await pool.query(`CREATE TABLE IF NOT EXISTS accounts (
+    provider VARCHAR(12) NOT NULL,
+    uid VARCHAR(64) NOT NULL,
+    player_id CHAR(32) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (provider, uid),
+    INDEX idx_player (player_id)
+  ) DEFAULT CHARSET=utf8mb4`);
+  // 登录后给每台新设备单独发一把密钥（只存哈希），这样多台设备可以同时在线
+  await pool.query(`CREATE TABLE IF NOT EXISTS player_secrets (
+    secret_hash CHAR(64) NOT NULL PRIMARY KEY,
+    player_id CHAR(32) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_p (player_id)
   ) DEFAULT CHARSET=utf8mb4`);
 }
 
@@ -130,6 +151,85 @@ function clientIp(req) {
   return xf || req.socket.remoteAddress || 'x';
 }
 
+async function secretMatches(storedHash, id, hash) {
+  const a = Buffer.from(storedHash); const c = Buffer.from(hash);
+  if (a.length === c.length && crypto.timingSafeEqual(a, c)) return true;
+  const [rows] = await pool.query('SELECT 1 FROM player_secrets WHERE secret_hash = ? AND player_id = ?', [hash, id]);
+  return rows.length > 0;
+}
+
+/** 本机身份是否有效：玩家存在且密钥对得上 */
+async function validIdentity(id, secret) {
+  if (!isHex32(id) || !isSecret(secret)) return false;
+  const [rows] = await pool.query('SELECT secret_hash FROM players WHERE id = ?', [id]);
+  return rows.length > 0 && secretMatches(rows[0].secret_hash, id, sha256(secret));
+}
+
+/* ---------- 第三方登录：校验凭证（可在测试里替换） ---------- */
+async function getJson(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try { const r = await fetch(url, { signal: ctrl.signal }); return { status: r.status, body: await r.json().catch(() => ({})) }; }
+  finally { clearTimeout(timer); }
+}
+const verifiers = {
+  async google(token) {
+    if (!GOOGLE_CLIENT_ID) throw new Error('google_not_configured');
+    const { status, body: j } = await getJson('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(token));
+    if (status !== 200 || j.aud !== GOOGLE_CLIENT_ID || !['accounts.google.com', 'https://accounts.google.com'].includes(j.iss)
+      || Number(j.exp) * 1000 < Date.now() || !j.sub) throw new Error('bad_token');
+    return { uid: String(j.sub), name: String(j.name || '').slice(0, 40) };
+  },
+  async facebook(token) {
+    if (!FB_APP_ID) throw new Error('facebook_not_configured');
+    const q = encodeURIComponent(token);
+    const app = await getJson('https://graph.facebook.com/app?access_token=' + q);   // 确认这个令牌是发给我们这个应用的
+    if (app.status !== 200 || String(app.body.id) !== FB_APP_ID) throw new Error('bad_token');
+    const me = await getJson('https://graph.facebook.com/me?fields=id,name&access_token=' + q);
+    if (me.status !== 200 || !me.body.id) throw new Error('bad_token');
+    return { uid: String(me.body.id), name: String(me.body.name || '').slice(0, 40) };
+  },
+};
+
+async function handleLogin(req, res, cors) {
+  let b;
+  try { b = await readJson(req); } catch (e) { return send(res, 400, { ok: false, error: e.message }, cors); }
+  const provider = b.provider;
+  if (!verifiers[provider] || typeof b.token !== 'string' || b.token.length > 4000) return send(res, 400, { ok: false, error: 'bad_request' }, cors);
+  let who;
+  try { who = await verifiers[provider](b.token); }
+  catch (e) {
+    const notCfg = /not_configured/.test(e.message);
+    return send(res, notCfg ? 503 : 401, { ok: false, error: notCfg ? 'not_configured' : 'bad_token' }, cors);
+  }
+  const uid = who.uid.slice(0, 64);
+  const cur = (await validIdentity(b.id, b.secret)) ? b.id : null;
+  const [acc] = await pool.query('SELECT player_id FROM accounts WHERE provider = ? AND uid = ?', [provider, uid]);
+  if (acc.length) {
+    const pid = acc[0].player_id;
+    if (cur === pid) return send(res, 200, { ok: true, id: pid, switched: false, name: who.name }, cors);
+    // 这个账号已经有进度：给这台设备发一把新密钥，让它切换到该账号的玩家
+    const secret = crypto.randomBytes(24).toString('hex');
+    await pool.query('INSERT INTO player_secrets (secret_hash, player_id) VALUES (?, ?)', [sha256(secret), pid]);
+    return send(res, 200, { ok: true, id: pid, secret, switched: true, name: who.name }, cors);
+  }
+  if (!cur) return send(res, 409, { ok: false, error: 'need_sync' }, cors);
+  const [mine] = await pool.query('SELECT uid FROM accounts WHERE player_id = ? AND provider = ?', [cur, provider]);
+  if (mine.length) return send(res, 409, { ok: false, error: 'already_linked' }, cors);
+  await pool.query('INSERT INTO accounts (provider, uid, player_id) VALUES (?, ?, ?)', [provider, uid, cur]);
+  send(res, 200, { ok: true, id: cur, switched: false, linked: true, name: who.name }, cors);
+}
+
+async function handleDelete(req, res, cors) {
+  let b;
+  try { b = await readJson(req); } catch (e) { return send(res, 400, { ok: false, error: e.message }, cors); }
+  if (!(await validIdentity(b.id, b.secret))) return send(res, 403, { ok: false, error: 'forbidden' }, cors);
+  await pool.query('DELETE FROM accounts WHERE player_id = ?', [b.id]);
+  await pool.query('DELETE FROM player_secrets WHERE player_id = ?', [b.id]);
+  await pool.query('DELETE FROM players WHERE id = ?', [b.id]);
+  send(res, 200, { ok: true }, cors);
+}
+
 async function handleSync(req, res, cors) {
   let b;
   try { b = await readJson(req); } catch (e) { return send(res, 400, { ok: false, error: e.message }, cors); }
@@ -150,8 +250,7 @@ async function handleSync(req, res, cors) {
       [b.id, hash, nickname, score, perfects, games, equipped, unlocked.join(',')]);
   } else {
     const r = rows[0];
-    const a = Buffer.from(r.secret_hash); const c = Buffer.from(hash);
-    if (a.length !== c.length || !crypto.timingSafeEqual(a, c)) return send(res, 403, { ok: false, error: 'forbidden' }, cors);
+    if (!(await secretMatches(r.secret_hash, b.id, hash))) return send(res, 403, { ok: false, error: 'forbidden' }, cors);
     // 分数、完美数、局数只增不减；已解锁的皮肤也只增不减
     const merged = cleanSkins([...(r.unlocked ? r.unlocked.split(',') : []), ...unlocked]);
     await pool.query(
@@ -173,8 +272,16 @@ async function route(req, res) {
     return send(res, 200, { ok: true }, cors);
   }
   if (req.method === 'POST' && path === '/api/sync') {
-    if (!allow(clientIp(req), 60)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
+    if (!allow(clientIp(req) + ':sync', 60)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
     return handleSync(req, res, cors);
+  }
+  if (req.method === 'POST' && path === '/api/auth/login') {
+    if (!allow(clientIp(req) + ':login', 20)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
+    return handleLogin(req, res, cors);
+  }
+  if (req.method === 'POST' && path === '/api/account/delete') {
+    if (!allow(clientIp(req) + ':del', 10)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
+    return handleDelete(req, res, cors);
   }
   if (req.method === 'GET' && path === '/api/leaderboard/top') {
     const limit = Math.max(1, Math.min(50, parseInt(url.searchParams.get('limit'), 10) || 10));
@@ -206,4 +313,4 @@ if (require.main === module) {
     .then(() => server.listen(PORT, () => console.log('jump3d-server listening on ' + PORT)))
     .catch((e) => { console.error('数据库连接/建表失败：', e.message); process.exit(1); });
 }
-module.exports = { server, initDb, pool };
+module.exports = { server, initDb, pool, verifiers };
