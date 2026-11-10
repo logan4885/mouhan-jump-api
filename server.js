@@ -1,7 +1,7 @@
 // 跳一跳 3D 排行榜后端：Node + MySQL（也兼容 TiDB Cloud）
 // 接口：
 //   POST /api/sync            上传/更新我的数据（首次调用自动注册）
-//   GET  /api/leaderboard/top 前 N 名（带头像、正在使用的皮肤）
+//   GET  /api/leaderboard/top 前 N 名（带头像、正在使用的皮肤）；?mode=rogue 为 Roguelike 榜
 //   GET  /api/player/:id      某个玩家的详情（已解锁皮肤 + 正在使用）
 //   GET  /api/health          健康检查
 //   POST /api/auth/login      用 Google / Facebook 登录：把本机玩家绑定到账号，或在新设备上取回账号的进度
@@ -27,6 +27,7 @@ const CAN_IDS = ['cola', 'lemon', 'blue', 'orange', 'gold', 'chrome', 'holo', 'n
 const FREE_CANS = ['cola', 'lemon', 'blue', 'orange'];
 const BLOCK_IDS = ['candy', 'neon'];
 const SKIN_KEYS = new Set([...CAN_IDS.map((i) => 'player:' + i), ...BLOCK_IDS.map((i) => 'block:' + i)]);
+const MAX_ROGUE = 200000;         // Roguelike 模式分数上限（倍率 Buff 叠加，比普通模式高得多）
 const MAX_SCORE = 20000;           // 单人最高分上限，超出一律拒绝
 const AVATARS = ['🐯', '🦊', '🐱', '🐼', '🐸', '🐵', '🐰', '🐻', '🦁', '🐨', '🐙', '🦄', '🐧', '🐶'];
 const PICK_AVATARS = [...AVATARS, '🦒', '🐘', '🐢', '🦉', '🐬', '🐳', '🦋', '🐝', '🐞', '🦖',
@@ -59,6 +60,9 @@ async function initDb() {
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_score (best_score)
   ) DEFAULT CHARSET=utf8mb4`);
+  // Roguelike 模式最高分（独立排行榜）：老库补一列，已存在则忽略
+  try { await pool.query('ALTER TABLE players ADD COLUMN rogue_best INT NOT NULL DEFAULT 0'); }
+  catch (e) { if (!(e.errno === 1060 || /duplicate column/i.test(e.message))) throw e; }
   // 头像（玩家自选的动物 emoji）：老库补一列，已存在则忽略
   try { await pool.query('ALTER TABLE players ADD COLUMN avatar VARCHAR(8) NULL'); }
   catch (e) { if (!(e.errno === 1060 || /duplicate column/i.test(e.message))) throw e; }
@@ -140,6 +144,11 @@ function publicPlayer(r, rank) {
     equipped: r.equipped, unlocked: r.unlocked ? r.unlocked.split(',') : [],
     total: CAN_IDS.length, ...look(r.id, r.avatar), ...(rank ? { rank } : {}),
   };
+}
+
+async function rogueRankOf(score) {
+  const [[row]] = await pool.query('SELECT COUNT(*) AS c FROM players WHERE rogue_best > ?', [score]);
+  return row.c + 1;
 }
 
 async function rankOf(score) {
@@ -273,6 +282,8 @@ async function handleSync(req, res, cors) {
   if (!isHex32(b.id) || !isSecret(b.secret)) return send(res, 400, { ok: false, error: 'bad_identity' }, cors);
   const score = clampInt(b.score, MAX_SCORE + 1);
   if (score > MAX_SCORE) return send(res, 400, { ok: false, error: 'bad_score' }, cors);
+  const rogue = b.rogueBest == null ? 0 : clampInt(b.rogueBest, MAX_ROGUE + 1);   // 老版本页面不带这个字段
+  if (rogue > MAX_ROGUE) return send(res, 400, { ok: false, error: 'bad_score' }, cors);
   const perfects = clampInt(b.perfects, 1e6);
   const games = clampInt(b.games, 1e6);
   const unlocked = cleanSkins(b.unlocked);
@@ -284,19 +295,19 @@ async function handleSync(req, res, cors) {
   const [rows] = await pool.query('SELECT secret_hash, unlocked FROM players WHERE id = ?', [b.id]);
   if (!rows.length) {
     await pool.query(
-      'INSERT INTO players (id, secret_hash, nickname, avatar, best_score, perfects, games, equipped, unlocked) VALUES (?,?,?,?,?,?,?,?,?)',
-      [b.id, hash, nickname, avatar, score, perfects, games, equipped, unlocked.join(',')]);
+      'INSERT INTO players (id, secret_hash, nickname, avatar, best_score, rogue_best, perfects, games, equipped, unlocked) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      [b.id, hash, nickname, avatar, score, rogue, perfects, games, equipped, unlocked.join(',')]);
   } else {
     const r = rows[0];
     if (!(await secretMatches(r.secret_hash, b.id, hash))) return send(res, 403, { ok: false, error: 'forbidden' }, cors);
     // 分数、完美数、局数只增不减；已解锁的皮肤也只增不减
     const merged = cleanSkins([...(r.unlocked ? r.unlocked.split(',') : []), ...unlocked]);
     await pool.query(
-      'UPDATE players SET nickname=?, avatar=COALESCE(?, avatar), best_score=GREATEST(best_score,?), perfects=GREATEST(perfects,?), games=GREATEST(games,?), equipped=?, unlocked=? WHERE id=?',
-      [nickname, avatar, score, perfects, games, equipped, merged.join(','), b.id]);
+      'UPDATE players SET nickname=?, avatar=COALESCE(?, avatar), best_score=GREATEST(best_score,?), rogue_best=GREATEST(rogue_best,?), perfects=GREATEST(perfects,?), games=GREATEST(games,?), equipped=?, unlocked=? WHERE id=?',
+      [nickname, avatar, score, rogue, perfects, games, equipped, merged.join(','), b.id]);
   }
-  const [[me]] = await pool.query('SELECT best_score, avatar FROM players WHERE id = ?', [b.id]);
-  send(res, 200, { ok: true, rank: await rankOf(me.best_score), score: me.best_score, avatar: look(b.id, me.avatar).avatar }, cors);
+  const [[me]] = await pool.query('SELECT best_score, rogue_best, avatar FROM players WHERE id = ?', [b.id]);
+  send(res, 200, { ok: true, rank: await rankOf(me.best_score), score: me.best_score, rogueScore: me.rogue_best, rogueRank: me.rogue_best > 0 ? await rogueRankOf(me.rogue_best) : null, avatar: look(b.id, me.avatar).avatar }, cors);
 }
 
 /* ---------- 同图比赛 ---------- */
@@ -425,8 +436,10 @@ async function route(req, res) {
   if (req.method === 'GET' && path === '/api/leaderboard/top') {
     const limit = Math.max(1, Math.min(100, parseInt(url.searchParams.get('limit'), 10) || 10));
     const offset = Math.max(0, Math.min(1000000, parseInt(url.searchParams.get('offset'), 10) || 0));   // 分页：往下滑动继续加载，直到看完所有人
-    const [rows] = await pool.query(
-      'SELECT id, nickname, avatar, best_score, equipped, unlocked FROM players WHERE best_score > 0 ORDER BY best_score DESC, updated_at ASC, id ASC LIMIT ? OFFSET ?', [limit, offset]);
+    const rogueMode = url.searchParams.get('mode') === 'rogue';   // Roguelike 榜
+    const [rows] = await pool.query(rogueMode
+      ? 'SELECT id, nickname, avatar, rogue_best AS best_score, equipped, unlocked FROM players WHERE rogue_best > 0 ORDER BY rogue_best DESC, updated_at ASC, id ASC LIMIT ? OFFSET ?'
+      : 'SELECT id, nickname, avatar, best_score, equipped, unlocked FROM players WHERE best_score > 0 ORDER BY best_score DESC, updated_at ASC, id ASC LIMIT ? OFFSET ?', [limit, offset]);
     return send(res, 200, rows.map((r) => ({ id: r.id, nickname: r.nickname, score: r.best_score, equipped: r.equipped, vip: isVip(r.unlocked), ...look(r.id, r.avatar) })),
       { ...cors, 'Cache-Control': 'public, max-age=5' });
   }
