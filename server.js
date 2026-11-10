@@ -369,6 +369,7 @@ async function handleRoomScore(req, res, cors) {
     await pool.query('INSERT IGNORE INTO room_players (code, pid) VALUES (?, ?)', [code, b.id]);
   }
   await pool.query('INSERT IGNORE INTO room_scores (code, rnd, pid, score) VALUES (?, ?, ?, ?)', [code, room.round, b.id, score]);
+  await pool.query('UPDATE players SET best_score = GREATEST(best_score, ?) WHERE id = ?', [score, b.id]);   // 房间成绩同样计入总排行榜
   send(res, 200, { ok: true, room: await roomView(code) }, cors);
 }
 
