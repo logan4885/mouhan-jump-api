@@ -8,7 +8,8 @@
 //   POST /api/account/delete  删除我的全部数据（玩家 + 绑定的账号）
 //   POST /api/room/create     同图比赛：开房间（返回 4 位房间码 + 地图种子）
 //   POST /api/room/join       加入房间
-//   POST /api/room/score      交本局成绩（每人每房间只收第一次）
+//   POST /api/room/score      交本局成绩（每人每局只收第一次）
+//   POST /api/room/rematch    同一个房间再来一局（换新地图种子，局数 +1）
 //   GET  /api/room/:code      房间里的玩家和成绩
 // 环境变量：GOOGLE_CLIENT_ID（Google OAuth 客户端 ID）、FB_APP_ID（Facebook 应用 ID）
 const crypto = require('crypto');
@@ -81,6 +82,7 @@ async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS rooms (
     code CHAR(4) NOT NULL PRIMARY KEY,
     seed INT NOT NULL,
+    rnd INT NOT NULL DEFAULT 1,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
   ) DEFAULT CHARSET=utf8mb4`);
   await pool.query(`CREATE TABLE IF NOT EXISTS room_players (
@@ -90,6 +92,17 @@ async function initDb() {
     joined_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TIMESTAMP NULL,
     PRIMARY KEY (code, pid)
+  ) DEFAULT CHARSET=utf8mb4`);
+  try { await pool.query('ALTER TABLE rooms ADD COLUMN rnd INT NOT NULL DEFAULT 1'); }
+  catch (e) { if (!(e.errno === 1060 || /duplicate column/i.test(e.message))) throw e; }
+  // 每个房间每一局每个人的成绩（同一个房间可以连续打很多局）
+  await pool.query(`CREATE TABLE IF NOT EXISTS room_scores (
+    code CHAR(4) NOT NULL,
+    rnd INT NOT NULL,
+    pid CHAR(32) NOT NULL,
+    score INT NOT NULL,
+    finished_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (code, rnd, pid)
   ) DEFAULT CHARSET=utf8mb4`);
 }
 
@@ -293,12 +306,13 @@ const isCode = (s) => typeof s === 'string' && /^[A-HJ-NP-Z2-9]{4}$/.test(s);
 const newCode = () => Array.from({ length: 4 }, () => ROOM_ALPHABET[crypto.randomInt(ROOM_ALPHABET.length)]).join('');
 
 async function roomView(code) {
-  const [rooms] = await pool.query('SELECT code, seed FROM rooms WHERE code = ? AND created_at > (NOW() - INTERVAL 1 DAY)', [code]);
+  const [rooms] = await pool.query('SELECT code, seed, rnd FROM rooms WHERE code = ? AND created_at > (NOW() - INTERVAL 1 DAY)', [code]);
   if (!rooms.length) return null;
+  const rnd = rooms[0].rnd || 1;
   const [rows] = await pool.query(
-    'SELECT rp.pid, rp.score, p.nickname, p.avatar FROM room_players rp LEFT JOIN players p ON p.id = rp.pid WHERE rp.code = ? ORDER BY rp.joined_at ASC, rp.pid ASC', [code]);
+    'SELECT rp.pid, s.score, p.nickname, p.avatar FROM room_players rp LEFT JOIN room_scores s ON s.code = rp.code AND s.pid = rp.pid AND s.rnd = ? LEFT JOIN players p ON p.id = rp.pid WHERE rp.code = ? ORDER BY rp.joined_at ASC, rp.pid ASC', [rnd, code]);
   return {
-    code, seed: rooms[0].seed,
+    code, seed: rooms[0].seed, round: rnd,
     players: rows.map((r) => ({ id: r.pid, nickname: r.nickname || 'Player', score: r.score === null ? null : r.score, ...look(r.pid, r.avatar) })),
   };
 }
@@ -313,6 +327,7 @@ async function roomBody(req, res, cors) {
 async function handleRoomCreate(req, res, cors) {
   const b = await roomBody(req, res, cors); if (!b) return;
   await pool.query('DELETE FROM room_players WHERE code IN (SELECT code FROM rooms WHERE created_at < (NOW() - INTERVAL 1 DAY))').catch(() => {});
+  await pool.query('DELETE FROM room_scores WHERE code IN (SELECT code FROM rooms WHERE created_at < (NOW() - INTERVAL 1 DAY))').catch(() => {});
   await pool.query('DELETE FROM rooms WHERE created_at < (NOW() - INTERVAL 1 DAY)').catch(() => {});
   const seed = crypto.randomInt(1, 2147483647);
   for (let i = 0; i < 12; i++) {
@@ -345,9 +360,29 @@ async function handleRoomScore(req, res, cors) {
   if (!isCode(code)) return send(res, 400, { ok: false, error: 'bad_code' }, cors);
   const score = Math.floor(Number(b.score));
   if (!(score >= 0 && score <= MAX_SCORE)) return send(res, 400, { ok: false, error: 'bad_score' }, cors);
-  if (!(await roomView(code))) return send(res, 404, { ok: false, error: 'no_room' }, cors);
-  await pool.query('INSERT IGNORE INTO room_players (code, pid) VALUES (?, ?)', [code, b.id]);
-  await pool.query('UPDATE room_players SET score = ?, finished_at = NOW() WHERE code = ? AND pid = ? AND score IS NULL', [score, code, b.id]);
+  const room = await roomView(code);
+  if (!room) return send(res, 404, { ok: false, error: 'no_room' }, cors);
+  if (Math.floor(Number(b.round)) !== room.round) return send(res, 409, { ok: false, error: 'stale' }, cors);   // 这一局已经被翻篇了
+  if (!room.players.some((p) => p.id === b.id)) {
+    if (room.players.length >= ROOM_MAX) return send(res, 409, { ok: false, error: 'full' }, cors);
+    await pool.query('INSERT IGNORE INTO room_players (code, pid) VALUES (?, ?)', [code, b.id]);
+  }
+  await pool.query('INSERT IGNORE INTO room_scores (code, rnd, pid, score) VALUES (?, ?, ?, ?)', [code, room.round, b.id, score]);
+  send(res, 200, { ok: true, room: await roomView(code) }, cors);
+}
+
+async function handleRoomRematch(req, res, cors) {
+  const b = await roomBody(req, res, cors); if (!b) return;
+  const code = String(b.code || '').toUpperCase();
+  if (!isCode(code)) return send(res, 400, { ok: false, error: 'bad_code' }, cors);
+  const room = await roomView(code);
+  if (!room) return send(res, 404, { ok: false, error: 'no_room' }, cors);
+  if (!room.players.some((p) => p.id === b.id)) return send(res, 403, { ok: false, error: 'forbidden' }, cors);
+  // 只有“还停在刚打完的那一局”时才翻篇；别人已经开了新的一局就直接返回最新的
+  if (room.round === Math.floor(Number(b.round))) {
+    if (room.round >= 99) return send(res, 409, { ok: false, error: 'max_rounds' }, cors);
+    await pool.query('UPDATE rooms SET rnd = rnd + 1, seed = ? WHERE code = ? AND rnd = ?', [crypto.randomInt(1, 2147483647), code, room.round]);
+  }
   send(res, 200, { ok: true, room: await roomView(code) }, cors);
 }
 
@@ -373,9 +408,9 @@ async function route(req, res) {
     if (!allow(clientIp(req) + ':del', 10)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
     return handleDelete(req, res, cors);
   }
-  if (req.method === 'POST' && /^\/api\/room\/(create|join|score)$/.test(path)) {
+  if (req.method === 'POST' && /^\/api\/room\/(create|join|score|rematch)$/.test(path)) {
     if (!allow(clientIp(req) + ':room', 40)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
-    return path.endsWith('create') ? handleRoomCreate(req, res, cors) : path.endsWith('join') ? handleRoomJoin(req, res, cors) : handleRoomScore(req, res, cors);
+    return path.endsWith('create') ? handleRoomCreate(req, res, cors) : path.endsWith('join') ? handleRoomJoin(req, res, cors) : path.endsWith('rematch') ? handleRoomRematch(req, res, cors) : handleRoomScore(req, res, cors);
   }
   const rm = path.match(/^\/api\/room\/([A-Za-z0-9]{4})$/);
   if (req.method === 'GET' && rm) {
