@@ -6,6 +6,10 @@
 //   GET  /api/health          健康检查
 //   POST /api/auth/login      用 Google / Facebook 登录：把本机玩家绑定到账号，或在新设备上取回账号的进度
 //   POST /api/account/delete  删除我的全部数据（玩家 + 绑定的账号）
+//   POST /api/room/create     同图比赛：开房间（返回 4 位房间码 + 地图种子）
+//   POST /api/room/join       加入房间
+//   POST /api/room/score      交本局成绩（每人每房间只收第一次）
+//   GET  /api/room/:code      房间里的玩家和成绩
 // 环境变量：GOOGLE_CLIENT_ID（Google OAuth 客户端 ID）、FB_APP_ID（Facebook 应用 ID）
 const crypto = require('crypto');
 const http = require('http');
@@ -72,6 +76,20 @@ async function initDb() {
     player_id CHAR(32) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_p (player_id)
+  ) DEFAULT CHARSET=utf8mb4`);
+  // 同图比赛：房间只记录种子和各人最终成绩，24 小时后清理
+  await pool.query(`CREATE TABLE IF NOT EXISTS rooms (
+    code CHAR(4) NOT NULL PRIMARY KEY,
+    seed INT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  ) DEFAULT CHARSET=utf8mb4`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS room_players (
+    code CHAR(4) NOT NULL,
+    pid CHAR(32) NOT NULL,
+    score INT NULL,
+    joined_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at TIMESTAMP NULL,
+    PRIMARY KEY (code, pid)
   ) DEFAULT CHARSET=utf8mb4`);
 }
 
@@ -268,6 +286,71 @@ async function handleSync(req, res, cors) {
   send(res, 200, { ok: true, rank: await rankOf(me.best_score), score: me.best_score, avatar: look(b.id, me.avatar).avatar }, cors);
 }
 
+/* ---------- 同图比赛 ---------- */
+const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const ROOM_MAX = 8;
+const isCode = (s) => typeof s === 'string' && /^[A-HJ-NP-Z2-9]{4}$/.test(s);
+const newCode = () => Array.from({ length: 4 }, () => ROOM_ALPHABET[crypto.randomInt(ROOM_ALPHABET.length)]).join('');
+
+async function roomView(code) {
+  const [rooms] = await pool.query('SELECT code, seed FROM rooms WHERE code = ? AND created_at > (NOW() - INTERVAL 1 DAY)', [code]);
+  if (!rooms.length) return null;
+  const [rows] = await pool.query(
+    'SELECT rp.pid, rp.score, p.nickname, p.avatar FROM room_players rp LEFT JOIN players p ON p.id = rp.pid WHERE rp.code = ? ORDER BY rp.joined_at ASC, rp.pid ASC', [code]);
+  return {
+    code, seed: rooms[0].seed,
+    players: rows.map((r) => ({ id: r.pid, nickname: r.nickname || 'Player', score: r.score === null ? null : r.score, ...look(r.pid, r.avatar) })),
+  };
+}
+
+async function roomBody(req, res, cors) {
+  let b;
+  try { b = await readJson(req); } catch (e) { send(res, 400, { ok: false, error: e.message }, cors); return null; }
+  if (!(await validIdentity(b.id, b.secret))) { send(res, 403, { ok: false, error: 'forbidden' }, cors); return null; }
+  return b;
+}
+
+async function handleRoomCreate(req, res, cors) {
+  const b = await roomBody(req, res, cors); if (!b) return;
+  await pool.query('DELETE FROM room_players WHERE code IN (SELECT code FROM rooms WHERE created_at < (NOW() - INTERVAL 1 DAY))').catch(() => {});
+  await pool.query('DELETE FROM rooms WHERE created_at < (NOW() - INTERVAL 1 DAY)').catch(() => {});
+  const seed = crypto.randomInt(1, 2147483647);
+  for (let i = 0; i < 12; i++) {
+    const code = newCode();
+    try { await pool.query('INSERT INTO rooms (code, seed) VALUES (?, ?)', [code, seed]); }
+    catch (e) { if (e.errno === 1062 || /duplicate/i.test(e.message)) continue; throw e; }
+    await pool.query('INSERT INTO room_players (code, pid) VALUES (?, ?)', [code, b.id]);
+    return send(res, 200, { ok: true, room: await roomView(code) }, cors);
+  }
+  send(res, 503, { ok: false, error: 'busy' }, cors);
+}
+
+async function handleRoomJoin(req, res, cors) {
+  const b = await roomBody(req, res, cors); if (!b) return;
+  const code = String(b.code || '').toUpperCase();
+  if (!isCode(code)) return send(res, 400, { ok: false, error: 'bad_code' }, cors);
+  let room = await roomView(code);
+  if (!room) return send(res, 404, { ok: false, error: 'no_room' }, cors);
+  if (!room.players.some((p) => p.id === b.id)) {
+    if (room.players.length >= ROOM_MAX) return send(res, 409, { ok: false, error: 'full' }, cors);
+    await pool.query('INSERT IGNORE INTO room_players (code, pid) VALUES (?, ?)', [code, b.id]);
+    room = await roomView(code);
+  }
+  send(res, 200, { ok: true, room }, cors);
+}
+
+async function handleRoomScore(req, res, cors) {
+  const b = await roomBody(req, res, cors); if (!b) return;
+  const code = String(b.code || '').toUpperCase();
+  if (!isCode(code)) return send(res, 400, { ok: false, error: 'bad_code' }, cors);
+  const score = Math.floor(Number(b.score));
+  if (!(score >= 0 && score <= MAX_SCORE)) return send(res, 400, { ok: false, error: 'bad_score' }, cors);
+  if (!(await roomView(code))) return send(res, 404, { ok: false, error: 'no_room' }, cors);
+  await pool.query('INSERT IGNORE INTO room_players (code, pid) VALUES (?, ?)', [code, b.id]);
+  await pool.query('UPDATE room_players SET score = ?, finished_at = NOW() WHERE code = ? AND pid = ? AND score IS NULL', [score, code, b.id]);
+  send(res, 200, { ok: true, room: await roomView(code) }, cors);
+}
+
 async function route(req, res) {
   const cors = corsHeaders(req);
   const url = new URL(req.url, 'http://x');
@@ -289,6 +372,18 @@ async function route(req, res) {
   if (req.method === 'POST' && path === '/api/account/delete') {
     if (!allow(clientIp(req) + ':del', 10)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
     return handleDelete(req, res, cors);
+  }
+  if (req.method === 'POST' && /^\/api\/room\/(create|join|score)$/.test(path)) {
+    if (!allow(clientIp(req) + ':room', 40)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
+    return path.endsWith('create') ? handleRoomCreate(req, res, cors) : path.endsWith('join') ? handleRoomJoin(req, res, cors) : handleRoomScore(req, res, cors);
+  }
+  const rm = path.match(/^\/api\/room\/([A-Za-z0-9]{4})$/);
+  if (req.method === 'GET' && rm) {
+    if (!allow(clientIp(req) + ':roomget', 120)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
+    const code = rm[1].toUpperCase();
+    if (!isCode(code)) return send(res, 400, { ok: false, error: 'bad_code' }, cors);
+    const room = await roomView(code);
+    return room ? send(res, 200, { ok: true, room }, { ...cors, 'Cache-Control': 'no-store' }) : send(res, 404, { ok: false, error: 'no_room' }, cors);
   }
   if (req.method === 'GET' && path === '/api/leaderboard/top') {
     const limit = Math.max(1, Math.min(100, parseInt(url.searchParams.get('limit'), 10) || 10));
