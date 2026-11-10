@@ -362,7 +362,8 @@ async function handleRoomScore(req, res, cors) {
   if (!(score >= 0 && score <= MAX_SCORE)) return send(res, 400, { ok: false, error: 'bad_score' }, cors);
   const room = await roomView(code);
   if (!room) return send(res, 404, { ok: false, error: 'no_room' }, cors);
-  if (Math.floor(Number(b.round)) !== room.round) return send(res, 409, { ok: false, error: 'stale' }, cors);   // 这一局已经被翻篇了
+  // 老版本页面（缓存）不带 round：按当前这一局收；带了 round 但已经翻篇才拒绝
+  if (b.round != null && Math.floor(Number(b.round)) !== room.round) return send(res, 409, { ok: false, error: 'stale' }, cors);
   if (!room.players.some((p) => p.id === b.id)) {
     if (room.players.length >= ROOM_MAX) return send(res, 409, { ok: false, error: 'full' }, cors);
     await pool.query('INSERT IGNORE INTO room_players (code, pid) VALUES (?, ?)', [code, b.id]);
