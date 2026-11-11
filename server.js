@@ -119,6 +119,18 @@ async function initDb() {
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_p (player_id)
   ) DEFAULT CHARSET=utf8mb4`);
+  // 邀请好友：每人一个邀请码；被邀请人（玩过至少 1 局）记一条；每满 10 条发一个 INV- 兑换码
+  await pool.query(`CREATE TABLE IF NOT EXISTS invite_links (
+    code CHAR(8) NOT NULL PRIMARY KEY, player_id CHAR(32) NOT NULL, INDEX idx_pl (player_id)
+  ) DEFAULT CHARSET=utf8mb4`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS referrals (
+    invitee_id CHAR(32) NOT NULL PRIMARY KEY, inviter_id CHAR(32) NOT NULL, ip_hash CHAR(16) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_inv (inviter_id)
+  ) DEFAULT CHARSET=utf8mb4`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS invite_rewards (
+    code VARCHAR(16) NOT NULL PRIMARY KEY, inviter_id CHAR(32) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, used_at TIMESTAMP NULL, used_by CHAR(32) NULL, INDEX idx_ir (inviter_id)
+  ) DEFAULT CHARSET=utf8mb4`);
   // 同图比赛：房间只记录种子和各人最终成绩，24 小时后清理
   await pool.query(`CREATE TABLE IF NOT EXISTS rooms (
     code CHAR(4) NOT NULL PRIMARY KEY,
@@ -350,6 +362,104 @@ async function handleSync(req, res, cors) {
   send(res, 200, { ok: true, week, rank: await rankOf(me.best_score), score: me.best_score, rogueScore: me.rogue_best, rogueRank: me.rogue_best > 0 ? await rogueRankOf(me.rogue_best) : null, avatar: look(b.id, me.avatar).avatar }, cors);
 }
 
+/* ---------- 邀请好友（每 10 个有效邀请 -> 1 个兑换码 -> 随机解锁 1 款特效罐） ---------- */
+const INVITE_STEP = 10;
+const REDEEMABLE = CAN_IDS.filter((i) => !FREE_CANS.includes(i));
+const INV_ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const randStr = (n) => Array.from({ length: n }, () => INV_ALPHA[crypto.randomInt(INV_ALPHA.length)]).join('');
+const isRef = (s) => typeof s === 'string' && /^[A-HJ-NP-Z2-9]{8}$/.test(s);
+const isInvCode = (s) => typeof s === 'string' && /^INV-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/.test(s);
+
+async function inviteCodeOf(pid) {
+  const [rows] = await pool.query('SELECT code FROM invite_links WHERE player_id = ?', [pid]);
+  if (rows.length) return rows[0].code;
+  for (let i = 0; i < 8; i++) {
+    const code = randStr(8);
+    try { await pool.query('INSERT INTO invite_links (code, player_id) VALUES (?,?)', [code, pid]); return code; }
+    catch (e) { if (e.errno !== 1062) throw e; const [r2] = await pool.query('SELECT code FROM invite_links WHERE player_id = ?', [pid]); if (r2.length) return r2[0].code; }
+  }
+  throw new Error('invite_code_fail');
+}
+
+const ownedOf = (u) => (u ? String(u).split(',') : []);
+const lockedFor = (u) => REDEEMABLE.filter((id) => !ownedOf(u).includes('player:' + id));
+
+/** 按邀请数补发兑换码：已发的 + 没用的不超过“还没解锁的罐子数”（集齐后不再发） */
+async function issueRewards(inviter) {
+  const [[c]] = await pool.query('SELECT COUNT(*) AS c FROM referrals WHERE inviter_id = ?', [inviter]);
+  const earned = Math.floor(Number(c.c) / INVITE_STEP);
+  let [[i]] = await pool.query('SELECT COUNT(*) AS c FROM invite_rewards WHERE inviter_id = ?', [inviter]); i = Number(i.c);
+  const [[u]] = await pool.query('SELECT COUNT(*) AS c FROM invite_rewards WHERE inviter_id = ? AND used_at IS NULL', [inviter]);
+  const [pr] = await pool.query('SELECT unlocked FROM players WHERE id = ?', [inviter]);
+  let unused = Number(u.c); const locked = pr.length ? lockedFor(pr[0].unlocked).length : 0;
+  while (i < earned && unused < locked) {
+    const code = 'INV-' + randStr(4) + '-' + randStr(4);
+    try { await pool.query('INSERT INTO invite_rewards (code, inviter_id) VALUES (?,?)', [code, inviter]); i += 1; unused += 1; }
+    catch (e) { if (e.errno !== 1062) throw e; }
+  }
+  return Number(c.c);
+}
+
+async function inviteBody(req, res, cors) {
+  let b;
+  try { b = await readJson(req); } catch (e) { send(res, 400, { ok: false, error: e.message }, cors); return null; }
+  if (!(await validIdentity(b.id, b.secret))) { send(res, 403, { ok: false, error: 'forbidden' }, cors); return null; }
+  return b;
+}
+
+async function handleInviteStatus(req, res, cors) {
+  const b = await inviteBody(req, res, cors); if (!b) return;
+  const code = await inviteCodeOf(b.id);
+  const count = await issueRewards(b.id);
+  const [rw] = await pool.query('SELECT code, used_at FROM invite_rewards WHERE inviter_id = ? ORDER BY created_at ASC, code ASC', [b.id]);
+  const [pr] = await pool.query('SELECT unlocked FROM players WHERE id = ?', [b.id]);
+  send(res, 200, { ok: true, code, count, step: INVITE_STEP, next: INVITE_STEP - (count % INVITE_STEP), rewards: rw.map((r) => ({ code: r.code, used: !!r.used_at })), allCollected: lockedFor(pr[0].unlocked).length === 0 }, cors);
+}
+
+/** 被邀请的新玩家：玩过 >=1 局后，用邀请码登记一次 */
+async function handleInviteClaim(req, res, cors) {
+  const b = await inviteBody(req, res, cors); if (!b) return;
+  const ref = String(b.ref || '').toUpperCase();
+  if (!isRef(ref)) return send(res, 200, { ok: false, error: 'bad_ref' }, cors);
+  const [[mine]] = [await pool.query('SELECT 1 FROM referrals WHERE invitee_id = ?', [b.id])];
+  if (mine.length) return send(res, 200, { ok: true, done: true }, cors);
+  const [lk] = await pool.query('SELECT player_id FROM invite_links WHERE code = ?', [ref]);
+  if (!lk.length) return send(res, 200, { ok: false, error: 'bad_ref' }, cors);
+  const inviter = lk[0].player_id;
+  if (inviter === b.id) return send(res, 200, { ok: false, error: 'self' }, cors);
+  const [[p]] = [await pool.query('SELECT games, created_at FROM players WHERE id = ?', [b.id])];
+  if (!p.length || Number(p[0].games) < 1) return send(res, 200, { ok: true, pending: true }, cors);   // 还没玩过一局：先等
+  const ct = p[0].created_at instanceof Date ? p[0].created_at.getTime() : Date.parse(String(p[0].created_at).replace(' ', 'T') + 'Z');
+  if (Date.now() - ct > 7 * 86400e3) return send(res, 200, { ok: false, error: 'too_old' }, cors);   // 老玩家不算新邀请
+  const ipH = sha256(clientIp(req) + ':jump-inv').slice(0, 16);
+  const [dup] = await pool.query('SELECT 1 FROM referrals WHERE inviter_id = ? AND ip_hash = ?', [inviter, ipH]);
+  if (dup.length) return send(res, 200, { ok: false, error: 'dup_ip' }, cors);          // 同一网络对同一个邀请人只算一次
+  const [[day]] = [await pool.query('SELECT COUNT(*) AS c FROM referrals WHERE ip_hash = ? AND created_at > (NOW() - INTERVAL 1 DAY)', [ipH])];
+  if (Number(day[0].c) >= 5) return send(res, 200, { ok: false, error: 'ip_limit' }, cors);
+  try { await pool.query('INSERT INTO referrals (invitee_id, inviter_id, ip_hash) VALUES (?,?,?)', [b.id, inviter, ipH]); }
+  catch (e) { if (e.errno !== 1062) throw e; return send(res, 200, { ok: true, done: true }, cors); }
+  await issueRewards(inviter);
+  send(res, 200, { ok: true, done: true }, cors);
+}
+
+async function handleInviteRedeem(req, res, cors) {
+  const b = await inviteBody(req, res, cors); if (!b) return;
+  const code = String(b.code || '').trim().toUpperCase();
+  if (!isInvCode(code)) return send(res, 200, { ok: false, error: 'bad' }, cors);
+  const [rw] = await pool.query('SELECT used_at FROM invite_rewards WHERE code = ?', [code]);
+  if (!rw.length) return send(res, 200, { ok: false, error: 'bad' }, cors);
+  if (rw[0].used_at) return send(res, 200, { ok: false, error: 'used' }, cors);
+  const [pr] = await pool.query('SELECT unlocked FROM players WHERE id = ?', [b.id]);
+  const locked = lockedFor(pr[0].unlocked);
+  if (!locked.length) return send(res, 200, { ok: false, error: 'none' }, cors);            // 全部集齐：不消耗兑换码
+  const pick = locked[crypto.randomInt(locked.length)];
+  const [r] = await pool.query('UPDATE invite_rewards SET used_at = NOW(), used_by = ? WHERE code = ? AND used_at IS NULL', [b.id, code]);
+  if (!r.affectedRows) return send(res, 200, { ok: false, error: 'used' }, cors);
+  const merged = cleanSkins([...ownedOf(pr[0].unlocked), 'player:' + pick]);
+  await pool.query('UPDATE players SET unlocked = ? WHERE id = ?', [merged.join(','), b.id]);
+  send(res, 200, { ok: true, skin: pick, unlocked: merged }, cors);
+}
+
 /* ---------- 同图比赛 ---------- */
 const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const ROOM_MAX = 8;
@@ -461,6 +571,10 @@ async function route(req, res) {
   if (req.method === 'POST' && path === '/api/account/delete') {
     if (!allow(clientIp(req) + ':del', 10)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
     return handleDelete(req, res, cors);
+  }
+  if (req.method === 'POST' && /^\/api\/invite\/(status|claim|redeem)$/.test(path)) {
+    if (!allow(clientIp(req) + ':inv', 40)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
+    return path.endsWith('status') ? handleInviteStatus(req, res, cors) : path.endsWith('claim') ? handleInviteClaim(req, res, cors) : handleInviteRedeem(req, res, cors);
   }
   if (req.method === 'POST' && /^\/api\/room\/(create|join|score|rematch)$/.test(path)) {
     if (!allow(clientIp(req) + ':room', 40)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
