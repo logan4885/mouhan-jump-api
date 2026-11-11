@@ -14,7 +14,9 @@
 //   GET  /api/chat            留言板（聊天大厅）：最新消息；?after=ID 只取更新的
 //   POST /api/chat/send       发消息（必须已登录账号；限频 + 敏感词过滤）
 //   POST /api/chat/report     举报某条消息（3 个不同的人举报会自动隐藏）
-//   POST /api/chat/admin      管理员（需 CHAT_ADMIN_KEY）：list / delete / restore / ban / unban / bans
+//   POST /api/chat/admin      管理员（需 CHAT_ADMIN_KEY）：list / delete / restore / ban / unban / bans；wa_list / wa_mark / wa_delete（WhatsApp 名单）
+//   POST /api/wa/claim        填 WhatsApp 号码（需登录 + 同意联系）领 1 款随机皮肤；每账号 / 每号码只能领一次
+//   POST /api/wa/status       我有没有领过
 // 环境变量：GOOGLE_CLIENT_ID（Google OAuth 客户端 ID）、FB_APP_ID（Facebook 应用 ID）、CHAT_ADMIN_KEY（留言板管理口令，不设则管理接口关闭）
 const crypto = require('crypto');
 const http = require('http');
@@ -176,6 +178,22 @@ async function initDb() {
     reporter CHAR(32) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (msg_id, reporter)
+  ) DEFAULT CHARSET=utf8mb4`);
+  // WhatsApp 名单：玩家自愿填号码 + 勾选同意联系，换 1 款随机皮肤。私域用；玩家删账号时一并删除。
+  await pool.query(`CREATE TABLE IF NOT EXISTS wa_leads (
+    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    pid CHAR(32) NOT NULL,
+    phone VARCHAR(16) NOT NULL,
+    cc VARCHAR(4) NOT NULL DEFAULT '',
+    lang VARCHAR(4) NOT NULL DEFAULT '',
+    skin VARCHAR(16) NOT NULL DEFAULT '',
+    ip_hash CHAR(16) NOT NULL DEFAULT '',
+    verified TINYINT NOT NULL DEFAULT 0,
+    note VARCHAR(200) NOT NULL DEFAULT '',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_pid (pid),
+    UNIQUE KEY uq_phone (phone),
+    INDEX idx_ip (ip_hash, created_at)
   ) DEFAULT CHARSET=utf8mb4`);
   await pool.query(`CREATE TABLE IF NOT EXISTS chat_bans (
     pid CHAR(32) NOT NULL PRIMARY KEY,
@@ -348,6 +366,7 @@ async function handleDelete(req, res, cors) {
   await pool.query('DELETE FROM accounts WHERE player_id = ?', [b.id]);
   await pool.query('DELETE FROM player_secrets WHERE player_id = ?', [b.id]);
   await pool.query('DELETE FROM chat_msgs WHERE pid = ?', [b.id]);
+  await pool.query('DELETE FROM wa_leads WHERE pid = ?', [b.id]);
   await pool.query('DELETE FROM players WHERE id = ?', [b.id]);
   send(res, 200, { ok: true }, cors);
 }
@@ -695,8 +714,87 @@ async function handleChatAdmin(req, res, cors) {
       return send(res, 200, { ok: true }, cors);
     }
     case 'unban': if (!isHex32(b.pid)) return send(res, 400, { ok: false, error: 'bad_pid' }, cors); await pool.query('DELETE FROM chat_bans WHERE pid = ?', [b.pid]); return send(res, 200, { ok: true }, cors);
+    case 'wa_list': {
+      const [rows] = await pool.query(`SELECT w.id, w.pid, w.phone, w.cc, w.lang, w.skin, w.verified, w.note, UNIX_TIMESTAMP(w.created_at) AS ts,
+          p.nickname, p.best_score, p.rogue_best, p.games,
+          (SELECT GROUP_CONCAT(a.provider) FROM accounts a WHERE a.player_id = w.pid) AS providers
+        FROM wa_leads w LEFT JOIN players p ON p.id = w.pid ORDER BY w.id DESC LIMIT 5000`);
+      return send(res, 200, { ok: true, leads: rows.map((r) => ({ id: Number(r.id), pid: r.pid, phone: r.phone, cc: r.cc, lang: r.lang, skin: r.skin, verified: !!r.verified, note: r.note,
+        ts: Number(r.ts), nick: r.nickname || '', best: Number(r.best_score || 0), rogue: Number(r.rogue_best || 0), games: Number(r.games || 0), providers: r.providers || '' })) }, cors);
+    }
+    case 'wa_mark': {
+      const wid = Math.floor(Number(b.wid)) || 0;
+      await pool.query('UPDATE wa_leads SET verified = ?, note = ? WHERE id = ?', [b.verified ? 1 : 0, String(b.note || '').slice(0, 200), wid]);
+      return send(res, 200, { ok: true }, cors);
+    }
+    case 'wa_delete': await pool.query('DELETE FROM wa_leads WHERE id = ?', [Math.floor(Number(b.wid)) || 0]); return send(res, 200, { ok: true }, cors);
     default: return send(res, 400, { ok: false, error: 'bad_action' }, cors);
   }
+}
+
+/* ---------- WhatsApp 领皮肤（私域名单） ---------- */
+const WA_VALID_CC = /^(1|7|2[07]|3[0-4569]|4[0-9]|5[1-8]|6[0-6]|8[1246]|9[0-58]|21[1-368]|22\d|23\d|24\d|25[0-8]|26\d|29[01789]|35\d|37\d|38[0-35-79]|42[013]|50\d|59\d|6[7-9]\d|85[0235-6]|87[0-8]|880|886|96\d|97[0-7]|99[2-8])/;
+// 常见市场的完整格式（总位数 + 手机号开头）；其它国家只检查 8–15 位
+const WA_RULES = [
+  [/^20/, /^201[0125]\d{8}$/],            // 埃及手机号：+20 10/11/12/15 + 8 位
+  [/^86/, /^861[3-9]\d{9}$/],             // 中国大陆手机号
+  [/^1/, /^1[2-9]\d{2}[2-9]\d{6}$/],      // 美国 / 加拿大
+  [/^966/, /^9665\d{8}$/],                // 沙特
+  [/^971/, /^9715\d{8}$/],                // 阿联酋
+  [/^44/, /^447\d{9}$/],                  // 英国手机号
+  [/^91/, /^91[6-9]\d{9}$/],              // 印度
+  [/^7/, /^79\d{9}$/],                    // 俄罗斯 / 哈萨克斯坦
+];
+
+/** 返回 { phone, cc } 或 { error }：只检查格式（没有验证码，没法确认号码属于本人） */
+function waNormalize(input) {
+  let d = String(input || '').normalize('NFKC').replace(/[^\d+]/g, '');
+  const plus = d.startsWith('+') || d.startsWith('00');
+  d = d.replace(/^\+/, '').replace(/^00/, '').replace(/\+/g, '');
+  if (!/^\d{8,15}$/.test(d)) return { error: 'bad_phone' };
+  if (d.startsWith('0') || (!plus && /^0/.test(String(input).replace(/\D/g, '')))) return { error: 'need_cc' };   // 本地格式（01012345678）：必须带国家区号
+  const m = d.match(WA_VALID_CC);
+  if (!m) return { error: 'bad_phone' };
+  for (const [cc, full] of WA_RULES) if (cc.test(d) && !full.test(d)) return { error: 'bad_phone' };
+  const national = d.slice(m[0].length);
+  if (/(\d)\1{6,}/.test(national) || /1234567|2345678|3456789|0123456|7654321|9876543/.test(national)) return { error: 'fake' };
+  return { phone: d, cc: m[0] };
+}
+
+const WA_PER_IP_DAY = 5;
+
+async function handleWaClaim(req, res, cors) {
+  const b = await chatBody(req, res, cors); if (!b) return;
+  const [acc] = await pool.query('SELECT 1 FROM accounts WHERE player_id = ? LIMIT 1', [b.id]);
+  if (!acc.length) return send(res, 403, { ok: false, error: 'login_required' }, cors);
+  if (b.consent !== true) return send(res, 400, { ok: false, error: 'no_consent' }, cors);
+  const n = waNormalize(b.phone);
+  if (n.error) return send(res, 400, { ok: false, error: n.error }, cors);
+  const [mine] = await pool.query('SELECT skin FROM wa_leads WHERE pid = ?', [b.id]);
+  if (mine.length) return send(res, 400, { ok: false, error: 'already' }, cors);
+  const ipHash = sha256(clientIp(req) + ':wa').slice(0, 16);
+  const [[cnt]] = await pool.query('SELECT COUNT(*) AS c FROM wa_leads WHERE ip_hash = ? AND created_at > DATE_SUB(NOW(), INTERVAL 1 DAY)', [ipHash]);
+  if (Number(cnt.c) >= WA_PER_IP_DAY) return send(res, 429, { ok: false, error: 'too_many' }, cors);
+  const [pr] = await pool.query('SELECT unlocked FROM players WHERE id = ?', [b.id]);
+  const locked = lockedFor(pr[0] && pr[0].unlocked);
+  if (!locked.length) return send(res, 400, { ok: false, error: 'none' }, cors);            // 皮肤已集齐：不收号码
+  const pick = locked[crypto.randomInt(locked.length)];
+  const lang = ['zh', 'en', 'ar'].includes(b.lang) ? b.lang : '';
+  try { await pool.query('INSERT INTO wa_leads (pid, phone, cc, lang, skin, ip_hash) VALUES (?,?,?,?,?,?)', [b.id, n.phone, n.cc, lang, pick, ipHash]); }
+  catch (e) {
+    if (e.errno !== 1062) throw e;
+    const [again] = await pool.query('SELECT 1 FROM wa_leads WHERE pid = ?', [b.id]);
+    return send(res, 400, { ok: false, error: again.length ? 'already' : 'phone_used' }, cors);
+  }
+  const merged = cleanSkins([...ownedOf(pr[0].unlocked), 'player:' + pick]);
+  await pool.query('UPDATE players SET unlocked = ? WHERE id = ?', [merged.join(','), b.id]);
+  send(res, 200, { ok: true, skin: pick, unlocked: merged }, cors);
+}
+
+async function handleWaStatus(req, res, cors) {
+  const b = await chatBody(req, res, cors); if (!b) return;
+  const [rows] = await pool.query('SELECT skin FROM wa_leads WHERE pid = ?', [b.id]);
+  send(res, 200, { ok: true, claimed: rows.length > 0, skin: rows.length ? rows[0].skin : '' }, cors);
 }
 
 async function chatPrune() {
@@ -745,6 +843,10 @@ async function route(req, res) {
   if (req.method === 'POST' && path === '/api/chat/report') {
     if (!allow(clientIp(req) + ':chatrep', 20)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
     return handleChatReport(req, res, cors);
+  }
+  if (req.method === 'POST' && (path === '/api/wa/claim' || path === '/api/wa/status')) {
+    if (!allow(clientIp(req) + ':wa', 20)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
+    return path.endsWith('claim') ? handleWaClaim(req, res, cors) : handleWaStatus(req, res, cors);
   }
   if (req.method === 'POST' && path === '/api/chat/admin') {
     if (!allow(clientIp(req) + ':chatadm', 20)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
@@ -796,4 +898,4 @@ if (require.main === module) {
     .then(() => server.listen(PORT, () => console.log('jump3d-server listening on ' + PORT)))
     .catch((e) => { console.error('数据库连接/建表失败：', e.message); process.exit(1); });
 }
-module.exports = { server, initDb, pool, verifiers, cairoWeekId, ensureWeek, chatBlocked };
+module.exports = { server, initDb, pool, verifiers, cairoWeekId, ensureWeek, chatBlocked, waNormalize };
