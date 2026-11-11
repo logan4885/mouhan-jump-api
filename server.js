@@ -46,6 +46,38 @@ const pool = mysql.createPool({
   charset: 'utf8mb4',
 });
 
+// ---- 每周重置：埃及时间（Africa/Cairo，含夏令时）每周五 00:00 清空两个排行榜 ----
+function cairoWeekId(d = new Date()) {   // 本周起点（周五）的日期，如 '2026-11-06'；前端 Storage.weekId 必须同算法
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Cairo', year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'short' }).formatToParts(d);
+  const g = (t) => parts.find((p) => p.type === t).value;
+  const idx = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[g('weekday')];
+  const back = (idx - 5 + 7) % 7;
+  return new Date(Date.UTC(+g('year'), +g('month') - 1, +g('day') - back)).toISOString().slice(0, 10);
+}
+let appliedWeek = null;
+/** 进入新的一周时：先把上周前 10 名存档，再清零 best_score / rogue_best。多实例/并发时靠 UPDATE ... WHERE v=旧值 抢占，只有一个会真正清零 */
+async function ensureWeek() {
+  const w = cairoWeekId();
+  if (w === appliedWeek) return w;
+  const [rows] = await pool.query("SELECT v FROM meta WHERE k = 'week'");
+  if (!rows.length) {
+    await pool.query("INSERT IGNORE INTO meta (k, v) VALUES ('week', ?)", [w]);   // 首次上线：只记下本周，不清已有成绩
+  } else if (rows[0].v !== w) {
+    const [r] = await pool.query("UPDATE meta SET v = ? WHERE k = 'week' AND v = ?", [w, rows[0].v]);
+    if (r.affectedRows === 1) {
+      const old = rows[0].v;
+      for (const [mode, col] of [['normal', 'best_score'], ['rogue', 'rogue_best']]) {
+        await pool.query(`INSERT IGNORE INTO weekly_top (wk, mode, rank_no, player_id, nickname, score)
+          SELECT ?, ?, 0, id, nickname, ${col} FROM players WHERE ${col} > 0 ORDER BY ${col} DESC, updated_at ASC LIMIT 10`, [old, mode]);
+      }
+      await pool.query('UPDATE players SET best_score = 0, rogue_best = 0');
+      console.log('[week] reset leaderboards for new week', w, '(archived', old + ')');
+    }
+  }
+  appliedWeek = w;
+  return w;
+}
+
 async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS players (
     id CHAR(32) NOT NULL PRIMARY KEY,
@@ -66,6 +98,11 @@ async function initDb() {
   // 头像（玩家自选的动物 emoji）：老库补一列，已存在则忽略
   try { await pool.query('ALTER TABLE players ADD COLUMN avatar VARCHAR(8) NULL'); }
   catch (e) { if (!(e.errno === 1060 || /duplicate column/i.test(e.message))) throw e; }
+  await pool.query(`CREATE TABLE IF NOT EXISTS meta (k VARCHAR(20) NOT NULL PRIMARY KEY, v VARCHAR(40) NOT NULL) DEFAULT CHARSET=utf8mb4`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS weekly_top (
+    wk CHAR(10) NOT NULL, mode VARCHAR(8) NOT NULL, rank_no INT NOT NULL DEFAULT 0, player_id CHAR(32) NOT NULL,
+    nickname VARCHAR(24) NOT NULL, score INT NOT NULL, PRIMARY KEY (wk, mode, player_id)
+  ) DEFAULT CHARSET=utf8mb4`);
   // 第三方账号 -> 玩家（只存服务商给的用户标识，不存邮箱、不存密码）
   await pool.query(`CREATE TABLE IF NOT EXISTS accounts (
     provider VARCHAR(12) NOT NULL,
@@ -280,10 +317,13 @@ async function handleSync(req, res, cors) {
   let b;
   try { b = await readJson(req); } catch (e) { return send(res, 400, { ok: false, error: e.message }, cors); }
   if (!isHex32(b.id) || !isSecret(b.secret)) return send(res, 400, { ok: false, error: 'bad_identity' }, cors);
-  const score = clampInt(b.score, MAX_SCORE + 1);
-  if (score > MAX_SCORE) return send(res, 400, { ok: false, error: 'bad_score' }, cors);
-  const rogue = b.rogueBest == null ? 0 : clampInt(b.rogueBest, MAX_ROGUE + 1);   // 老版本页面不带这个字段
-  if (rogue > MAX_ROGUE) return send(res, 400, { ok: false, error: 'bad_score' }, cors);
+  const week = await ensureWeek();
+  const fresh = b.week === week;   // 没带 week（老页面）或上周的页面：不收它的分数，避免旧高分回流进新一周的榜
+  const rawScore = clampInt(b.score, MAX_SCORE + 1);
+  if (rawScore > MAX_SCORE) return send(res, 400, { ok: false, error: 'bad_score' }, cors);
+  const rawRogue = b.rogueBest == null ? 0 : clampInt(b.rogueBest, MAX_ROGUE + 1);   // 老版本页面不带这个字段
+  if (rawRogue > MAX_ROGUE) return send(res, 400, { ok: false, error: 'bad_score' }, cors);
+  const score = fresh ? rawScore : 0, rogue = fresh ? rawRogue : 0;
   const perfects = clampInt(b.perfects, 1e6);
   const games = clampInt(b.games, 1e6);
   const unlocked = cleanSkins(b.unlocked);
@@ -307,7 +347,7 @@ async function handleSync(req, res, cors) {
       [nickname, avatar, score, rogue, perfects, games, equipped, merged.join(','), b.id]);
   }
   const [[me]] = await pool.query('SELECT best_score, rogue_best, avatar FROM players WHERE id = ?', [b.id]);
-  send(res, 200, { ok: true, rank: await rankOf(me.best_score), score: me.best_score, rogueScore: me.rogue_best, rogueRank: me.rogue_best > 0 ? await rogueRankOf(me.rogue_best) : null, avatar: look(b.id, me.avatar).avatar }, cors);
+  send(res, 200, { ok: true, week, rank: await rankOf(me.best_score), score: me.best_score, rogueScore: me.rogue_best, rogueRank: me.rogue_best > 0 ? await rogueRankOf(me.rogue_best) : null, avatar: look(b.id, me.avatar).avatar }, cors);
 }
 
 /* ---------- 同图比赛 ---------- */
@@ -380,6 +420,7 @@ async function handleRoomScore(req, res, cors) {
     await pool.query('INSERT IGNORE INTO room_players (code, pid) VALUES (?, ?)', [code, b.id]);
   }
   await pool.query('INSERT IGNORE INTO room_scores (code, rnd, pid, score) VALUES (?, ?, ?, ?)', [code, room.round, b.id, score]);
+  await ensureWeek();
   await pool.query('UPDATE players SET best_score = GREATEST(best_score, ?) WHERE id = ?', [score, b.id]);   // 房间成绩同样计入总排行榜
   send(res, 200, { ok: true, room: await roomView(code) }, cors);
 }
@@ -436,6 +477,7 @@ async function route(req, res) {
   if (req.method === 'GET' && path === '/api/leaderboard/top') {
     const limit = Math.max(1, Math.min(100, parseInt(url.searchParams.get('limit'), 10) || 10));
     const offset = Math.max(0, Math.min(1000000, parseInt(url.searchParams.get('offset'), 10) || 0));   // 分页：往下滑动继续加载，直到看完所有人
+    await ensureWeek();
     const rogueMode = url.searchParams.get('mode') === 'rogue';   // Roguelike 榜
     const [rows] = await pool.query(rogueMode
       ? 'SELECT id, nickname, avatar, rogue_best AS best_score, equipped, unlocked FROM players WHERE rogue_best > 0 ORDER BY rogue_best DESC, updated_at ASC, id ASC LIMIT ? OFFSET ?'
@@ -446,6 +488,7 @@ async function route(req, res) {
   const m = path.match(/^\/api\/player\/([^/]+)$/);
   if (req.method === 'GET' && m) {
     if (!isHex32(m[1])) return send(res, 400, { ok: false, error: 'bad_id' }, cors);
+    await ensureWeek();
     const [rows] = await pool.query('SELECT * FROM players WHERE id = ?', [m[1]]);
     if (!rows.length) return send(res, 404, { ok: false, error: 'not_found' }, cors);
     const [[cnt]] = await pool.query('SELECT COUNT(*) AS c FROM players WHERE best_score > 0');
@@ -463,7 +506,9 @@ const server = http.createServer((req, res) => {
 
 if (require.main === module) {
   initDb()
+    .then(() => ensureWeek())
+    .then(() => { setInterval(() => ensureWeek().catch((e) => console.error('[week]', e.message)), 60000).unref(); })
     .then(() => server.listen(PORT, () => console.log('jump3d-server listening on ' + PORT)))
     .catch((e) => { console.error('数据库连接/建表失败：', e.message); process.exit(1); });
 }
-module.exports = { server, initDb, pool, verifiers };
+module.exports = { server, initDb, pool, verifiers, cairoWeekId, ensureWeek };
