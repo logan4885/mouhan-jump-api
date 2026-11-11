@@ -11,7 +11,11 @@
 //   POST /api/room/score      交本局成绩（每人每局只收第一次）
 //   POST /api/room/rematch    同一个房间再来一局（换新地图种子，局数 +1）
 //   GET  /api/room/:code      房间里的玩家和成绩
-// 环境变量：GOOGLE_CLIENT_ID（Google OAuth 客户端 ID）、FB_APP_ID（Facebook 应用 ID）
+//   GET  /api/chat            留言板（聊天大厅）：最新消息；?after=ID 只取更新的
+//   POST /api/chat/send       发消息（必须已登录账号；限频 + 敏感词过滤）
+//   POST /api/chat/report     举报某条消息（3 个不同的人举报会自动隐藏）
+//   POST /api/chat/admin      管理员（需 CHAT_ADMIN_KEY）：list / delete / restore / ban / unban / bans
+// 环境变量：GOOGLE_CLIENT_ID（Google OAuth 客户端 ID）、FB_APP_ID（Facebook 应用 ID）、CHAT_ADMIN_KEY（留言板管理口令，不设则管理接口关闭）
 const crypto = require('crypto');
 const http = require('http');
 const mysql = require('mysql2/promise');
@@ -156,6 +160,28 @@ async function initDb() {
     score INT NOT NULL,
     finished_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (code, rnd, pid)
+  ) DEFAULT CHARSET=utf8mb4`);
+  // 留言板（聊天大厅）：消息 / 举报 / 禁言
+  await pool.query(`CREATE TABLE IF NOT EXISTS chat_msgs (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    pid CHAR(32) NOT NULL,
+    text VARCHAR(400) NOT NULL,
+    hidden TINYINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_pid (pid),
+    INDEX idx_created (created_at)
+  ) DEFAULT CHARSET=utf8mb4`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS chat_reports (
+    msg_id BIGINT NOT NULL,
+    reporter CHAR(32) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (msg_id, reporter)
+  ) DEFAULT CHARSET=utf8mb4`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS chat_bans (
+    pid CHAR(32) NOT NULL PRIMARY KEY,
+    until_at DATETIME NULL,
+    reason VARCHAR(80) NOT NULL DEFAULT '',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
   ) DEFAULT CHARSET=utf8mb4`);
 }
 
@@ -321,6 +347,7 @@ async function handleDelete(req, res, cors) {
   if (!(await validIdentity(b.id, b.secret))) return send(res, 403, { ok: false, error: 'forbidden' }, cors);
   await pool.query('DELETE FROM accounts WHERE player_id = ?', [b.id]);
   await pool.query('DELETE FROM player_secrets WHERE player_id = ?', [b.id]);
+  await pool.query('DELETE FROM chat_msgs WHERE pid = ?', [b.id]);
   await pool.query('DELETE FROM players WHERE id = ?', [b.id]);
   send(res, 200, { ok: true }, cors);
 }
@@ -550,6 +577,133 @@ async function handleRoomRematch(req, res, cors) {
   send(res, 200, { ok: true, room: await roomView(code) }, cors);
 }
 
+/* ---------- 留言板（聊天大厅） ---------- */
+const CHAT_MAX_LEN = 120;           // 单条最多字数
+const CHAT_MIN_GAP = 3000;          // 同一玩家两条消息至少间隔 3 秒
+const CHAT_PER_MIN = 10;            // 同一玩家每分钟最多 10 条
+const CHAT_KEEP_DAYS = 7;           // 消息保留 7 天
+const CHAT_HIDE_AT = 3;             // 3 个不同的人举报就自动隐藏
+const CHAT_ADMIN_KEY = process.env.CHAT_ADMIN_KEY || '';
+// 敏感词（比对时会去掉空格和标点、转小写）。想加词直接往里加；只拦明显的脏话 / 广告引流，其它靠举报 + 管理员。
+const CHAT_BAD = ['傻逼', '煞笔', '沙比', '傻b', '操你', '草你', '肏', '草泥马', '你妈死', '妈的智障', '去死吧', 'nmsl', 'cnm', 'sb的',
+  'fuck', 'shit', 'bitch', 'asshole', 'nigger', 'nigga', 'faggot', 'cunt', 'whore', 'dickhead',
+  '约炮', '裸聊', '赌博', '博彩', '代刷', '刷单', '兼职日结'];
+
+function chatNorm(s) { return String(s).normalize('NFKC').toLowerCase().replace(/[\s\-_.,，。·•*~`'"!?！？、:：;；|/\\]+/g, ''); }
+
+/** 返回 null 表示通过，否则返回拒绝原因 */
+function chatBlocked(text) {
+  const raw = String(text).normalize('NFKC').toLowerCase();
+  if (/https?:|www\.|[a-z0-9]\s?\.\s?(com|net|org|cn|io|me|cc|xyz|top|vip|ly|gg|app|dev|site|shop|club|link)\b/.test(raw)) return 'link';
+  if (/(微信|威信|v信|vx|wechat|whatsapp|telegram|tg|qq|扣扣|line|ins|instagram|snap)\s*(?:[:：是号@]\s*[a-z0-9_-]{4,}|(?=[a-z0-9_-]*\d)[a-z0-9_-]{4,})/.test(raw)) return 'contact';
+  const n = chatNorm(text);
+  if (/\d{9,}/.test(n)) return 'contact';
+  if (CHAT_BAD.some((w) => n.includes(w))) return 'bad_word';
+  return null;
+}
+
+const chatLast = new Map();   // pid -> { t, times[], text, tt }
+setInterval(() => { const now = Date.now(); for (const [k, v] of chatLast) if (now - v.t > 120000) chatLast.delete(k); }, 60000).unref();
+
+function chatLook(r) {
+  const l = look(r.pid, r.avatar);
+  return { id: Number(r.id), pid: r.pid, nick: r.nickname || '?', avatar: l.avatar, color: l.color, vip: isVip(r.unlocked), text: r.text, ts: Number(r.ts) };
+}
+
+async function chatBanned(pid) {
+  const [rows] = await pool.query('SELECT until_at FROM chat_bans WHERE pid = ? AND (until_at IS NULL OR until_at > NOW())', [pid]);
+  return rows.length > 0;
+}
+
+async function handleChatList(url, res, cors) {
+  const after = Math.max(0, parseInt(url.searchParams.get('after'), 10) || 0);
+  const sel = `SELECT m.id, m.pid, m.text, UNIX_TIMESTAMP(m.created_at) AS ts, p.nickname, p.avatar, p.unlocked
+    FROM chat_msgs m LEFT JOIN players p ON p.id = m.pid WHERE m.hidden = 0`;
+  let rows;
+  if (after) [rows] = await pool.query(sel + ' AND m.id > ? ORDER BY m.id ASC LIMIT 100', [after]);
+  else { [rows] = await pool.query(sel + ' ORDER BY m.id DESC LIMIT 60'); rows.reverse(); }
+  const [gone] = after ? await pool.query('SELECT id FROM chat_msgs WHERE hidden = 1 AND id > ? LIMIT 200', [Math.max(0, after - 100)]) : [[]];
+  send(res, 200, { ok: true, msgs: rows.map(chatLook), gone: gone.map((g) => Number(g.id)), max: CHAT_MAX_LEN }, { ...cors, 'Cache-Control': 'no-store' });
+}
+
+async function chatBody(req, res, cors) {
+  let b;
+  try { b = await readJson(req); } catch (e) { send(res, 400, { ok: false, error: e.message }, cors); return null; }
+  if (!(await validIdentity(b.id, b.secret))) { send(res, 403, { ok: false, error: 'forbidden' }, cors); return null; }
+  return b;
+}
+
+async function handleChatSend(req, res, cors) {
+  const b = await chatBody(req, res, cors); if (!b) return;
+  const [acc] = await pool.query('SELECT 1 FROM accounts WHERE player_id = ? LIMIT 1', [b.id]);
+  if (!acc.length) return send(res, 403, { ok: false, error: 'login_required' }, cors);
+  if (await chatBanned(b.id)) return send(res, 403, { ok: false, error: 'banned' }, cors);
+  const text = Array.from(String(b.text || '').replace(/[\u0000-\u001f\u007f<>]/g, ' ').replace(/\s+/g, ' ').trim()).slice(0, CHAT_MAX_LEN).join('');
+  if (!text) return send(res, 400, { ok: false, error: 'empty' }, cors);
+  const bad = chatBlocked(text);
+  if (bad) return send(res, 400, { ok: false, error: bad }, cors);
+  const now = Date.now();
+  const st = chatLast.get(b.id) || { t: 0, times: [], text: '', tt: 0 };
+  st.times = st.times.filter((x) => now - x < 60000);
+  if (now - st.t < CHAT_MIN_GAP || st.times.length >= CHAT_PER_MIN) return send(res, 429, { ok: false, error: 'slow_down' }, cors);
+  if (st.text === text && now - st.tt < 60000) return send(res, 400, { ok: false, error: 'duplicate' }, cors);
+  st.t = now; st.times.push(now); st.text = text; st.tt = now; chatLast.set(b.id, st);
+  const [r] = await pool.query('INSERT INTO chat_msgs (pid, text) VALUES (?, ?)', [b.id, text]);
+  const [rows] = await pool.query(`SELECT m.id, m.pid, m.text, UNIX_TIMESTAMP(m.created_at) AS ts, p.nickname, p.avatar, p.unlocked
+    FROM chat_msgs m LEFT JOIN players p ON p.id = m.pid WHERE m.id = ?`, [r.insertId]);
+  send(res, 200, { ok: true, msg: chatLook(rows[0]) }, cors);
+}
+
+async function handleChatReport(req, res, cors) {
+  const b = await chatBody(req, res, cors); if (!b) return;
+  const mid = Math.floor(Number(b.msg));
+  if (!(mid > 0)) return send(res, 400, { ok: false, error: 'bad_msg' }, cors);
+  const [rows] = await pool.query('SELECT pid FROM chat_msgs WHERE id = ?', [mid]);
+  if (!rows.length) return send(res, 404, { ok: false, error: 'no_msg' }, cors);
+  if (rows[0].pid === b.id) return send(res, 400, { ok: false, error: 'own_msg' }, cors);
+  await pool.query('INSERT IGNORE INTO chat_reports (msg_id, reporter) VALUES (?, ?)', [mid, b.id]);
+  const [[c]] = await pool.query('SELECT COUNT(*) AS c FROM chat_reports WHERE msg_id = ?', [mid]);
+  if (Number(c.c) >= CHAT_HIDE_AT) await pool.query('UPDATE chat_msgs SET hidden = 1 WHERE id = ?', [mid]);
+  send(res, 200, { ok: true }, cors);
+}
+
+const keyMatches = (k) => { if (!CHAT_ADMIN_KEY || typeof k !== 'string') return false; return crypto.timingSafeEqual(Buffer.from(sha256(k)), Buffer.from(sha256(CHAT_ADMIN_KEY))); };
+
+async function handleChatAdmin(req, res, cors) {
+  if (!CHAT_ADMIN_KEY) return send(res, 404, { ok: false, error: 'disabled' }, cors);
+  let b;
+  try { b = await readJson(req); } catch (e) { return send(res, 400, { ok: false, error: e.message }, cors); }
+  if (!keyMatches(b.key)) return send(res, 403, { ok: false, error: 'forbidden' }, cors);
+  const mid = Math.floor(Number(b.msg)) || 0;
+  switch (b.action) {
+    case 'list': {
+      const [rows] = await pool.query(`SELECT m.id, m.pid, m.text, m.hidden, UNIX_TIMESTAMP(m.created_at) AS ts, p.nickname, p.avatar, p.unlocked,
+          (SELECT COUNT(*) FROM chat_reports r WHERE r.msg_id = m.id) AS reports,
+          (SELECT COUNT(*) FROM chat_bans x WHERE x.pid = m.pid AND (x.until_at IS NULL OR x.until_at > NOW())) AS banned
+        FROM chat_msgs m LEFT JOIN players p ON p.id = m.pid ORDER BY m.id DESC LIMIT 150`);
+      return send(res, 200, { ok: true, msgs: rows.map((r) => ({ ...chatLook(r), hidden: !!r.hidden, reports: Number(r.reports), banned: Number(r.banned) > 0 })) }, cors);
+    }
+    case 'delete': await pool.query('UPDATE chat_msgs SET hidden = 1 WHERE id = ?', [mid]); return send(res, 200, { ok: true }, cors);
+    case 'restore': await pool.query('UPDATE chat_msgs SET hidden = 0 WHERE id = ?', [mid]); await pool.query('DELETE FROM chat_reports WHERE msg_id = ?', [mid]); return send(res, 200, { ok: true }, cors);
+    case 'ban': {
+      if (!isHex32(b.pid)) return send(res, 400, { ok: false, error: 'bad_pid' }, cors);
+      const hours = Math.floor(Number(b.hours)) || 0;           // 0 = 永久
+      const reason = String(b.reason || '').slice(0, 80);
+      if (hours > 0) await pool.query('REPLACE INTO chat_bans (pid, until_at, reason) VALUES (?, DATE_ADD(NOW(), INTERVAL ? HOUR), ?)', [b.pid, Math.min(hours, 24 * 365), reason]);
+      else await pool.query('REPLACE INTO chat_bans (pid, until_at, reason) VALUES (?, NULL, ?)', [b.pid, reason]);
+      if (b.purge) await pool.query('UPDATE chat_msgs SET hidden = 1 WHERE pid = ?', [b.pid]);
+      return send(res, 200, { ok: true }, cors);
+    }
+    case 'unban': if (!isHex32(b.pid)) return send(res, 400, { ok: false, error: 'bad_pid' }, cors); await pool.query('DELETE FROM chat_bans WHERE pid = ?', [b.pid]); return send(res, 200, { ok: true }, cors);
+    default: return send(res, 400, { ok: false, error: 'bad_action' }, cors);
+  }
+}
+
+async function chatPrune() {
+  await pool.query('DELETE FROM chat_msgs WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY)', [CHAT_KEEP_DAYS]);
+  await pool.query('DELETE FROM chat_reports WHERE msg_id NOT IN (SELECT id FROM chat_msgs)');
+}
+
 async function route(req, res) {
   const cors = corsHeaders(req);
   const url = new URL(req.url, 'http://x');
@@ -579,6 +733,22 @@ async function route(req, res) {
   if (req.method === 'POST' && /^\/api\/room\/(create|join|score|rematch)$/.test(path)) {
     if (!allow(clientIp(req) + ':room', 40)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
     return path.endsWith('create') ? handleRoomCreate(req, res, cors) : path.endsWith('join') ? handleRoomJoin(req, res, cors) : path.endsWith('rematch') ? handleRoomRematch(req, res, cors) : handleRoomScore(req, res, cors);
+  }
+  if (req.method === 'GET' && path === '/api/chat') {
+    if (!allow(clientIp(req) + ':chatget', 90)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
+    return handleChatList(url, res, cors);
+  }
+  if (req.method === 'POST' && path === '/api/chat/send') {
+    if (!allow(clientIp(req) + ':chatsend', 30)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
+    return handleChatSend(req, res, cors);
+  }
+  if (req.method === 'POST' && path === '/api/chat/report') {
+    if (!allow(clientIp(req) + ':chatrep', 20)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
+    return handleChatReport(req, res, cors);
+  }
+  if (req.method === 'POST' && path === '/api/chat/admin') {
+    if (!allow(clientIp(req) + ':chatadm', 20)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
+    return handleChatAdmin(req, res, cors);
   }
   const rm = path.match(/^\/api\/room\/([A-Za-z0-9]{4})$/);
   if (req.method === 'GET' && rm) {
@@ -622,7 +792,8 @@ if (require.main === module) {
   initDb()
     .then(() => ensureWeek())
     .then(() => { setInterval(() => ensureWeek().catch((e) => console.error('[week]', e.message)), 60000).unref(); })
+    .then(() => { chatPrune().catch(() => {}); setInterval(() => chatPrune().catch((e) => console.error('[chat]', e.message)), 3600000).unref(); })
     .then(() => server.listen(PORT, () => console.log('jump3d-server listening on ' + PORT)))
     .catch((e) => { console.error('数据库连接/建表失败：', e.message); process.exit(1); });
 }
-module.exports = { server, initDb, pool, verifiers, cairoWeekId, ensureWeek };
+module.exports = { server, initDb, pool, verifiers, cairoWeekId, ensureWeek, chatBlocked };
