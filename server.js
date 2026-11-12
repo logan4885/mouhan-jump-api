@@ -19,6 +19,8 @@
 //   POST /api/chat/admin      管理员（需 CHAT_ADMIN_KEY）：list / delete / restore / ban / unban / bans；wa_list / wa_mark / wa_delete（WhatsApp 名单）
 //   POST /api/wa/claim        填 WhatsApp 号码（需登录 + 同意联系）领 1 款随机皮肤；每账号 / 每号码只能领一次
 //   POST /api/wa/status       我有没有领过
+//   POST /api/run/start       普通模式开一局：服务器记下开始时间，返回我的“靠分数解锁”进度
+//   POST /api/run/finish      交本局分数：服务器按“用时 × 每秒最多得分”核对，合理才计入历史最高分，每满 100 分发 1 款随机特效罐
 // 环境变量：GOOGLE_CLIENT_ID（Google OAuth 客户端 ID）、FB_APP_ID（Facebook 应用 ID）、CHAT_ADMIN_KEY（留言板管理口令，不设则管理接口关闭）
 const crypto = require('crypto');
 const http = require('http');
@@ -106,6 +108,11 @@ async function initDb() {
   // 头像（玩家自选的动物 emoji）：老库补一列，已存在则忽略
   try { await pool.query('ALTER TABLE players ADD COLUMN avatar VARCHAR(8) NULL'); }
   catch (e) { if (!(e.errno === 1060 || /duplicate column/i.test(e.message))) throw e; }
+  // 靠分数解锁皮肤：历史单局最高分（不随每周重置）+ 已经靠分数发过几款
+  for (const col of ['all_best', 'earned']) {
+    try { await pool.query(`ALTER TABLE players ADD COLUMN ${col} INT NOT NULL DEFAULT 0`); }
+    catch (e) { if (!(e.errno === 1060 || /duplicate column/i.test(e.message))) throw e; }
+  }
   await pool.query(`CREATE TABLE IF NOT EXISTS meta (k VARCHAR(20) NOT NULL PRIMARY KEY, v VARCHAR(40) NOT NULL) DEFAULT CHARSET=utf8mb4`);
   await pool.query(`CREATE TABLE IF NOT EXISTS weekly_top (
     wk CHAR(10) NOT NULL, mode VARCHAR(8) NOT NULL, rank_no INT NOT NULL DEFAULT 0, player_id CHAR(32) NOT NULL,
@@ -827,6 +834,51 @@ async function handleWaClaim(req, res, cors) {
   send(res, 200, { ok: true, skin: pick, unlocked: merged }, cors);
 }
 
+/* ---------- 靠分数解锁皮肤（普通模式：单局最高分每满 100 分 → 随机解锁 1 款还没有的特效罐） ---------- */
+const EARN_STEP = 100;            // 每多少分发 1 款
+const EARN_MAX_RATE = 24;         // 每秒最多得多少分（连续完美单跳最高约 16 分，一跳至少约 1 秒；留足余量，宁可放过也不误杀真玩家）
+const EARN_SLACK = 12;            // 再多给的固定分数余量
+const runs = new Map();           // pid -> 开始时间（毫秒）；单实例内存，重启后进行中的一局不计
+setInterval(() => { const now = Date.now(); for (const [k, t] of runs) if (now - t > 3 * 3600 * 1000) runs.delete(k); }, 600000).unref();
+
+const earnInfo = (allBest, earned) => ({ allBest, earned, step: EARN_STEP, total: REDEEMABLE.length, next: earned >= REDEEMABLE.length ? null : (earned + 1) * EARN_STEP });
+
+async function handleRunStart(req, res, cors) {
+  const b = await chatBody(req, res, cors); if (!b) return;
+  runs.set(b.id, Date.now());
+  const [[r]] = await pool.query('SELECT all_best, earned FROM players WHERE id = ?', [b.id]);
+  send(res, 200, { ok: true, ...earnInfo(Number(r.all_best || 0), Number(r.earned || 0)) }, cors);
+}
+
+async function handleRunFinish(req, res, cors) {
+  const b = await chatBody(req, res, cors); if (!b) return;
+  const score = clampInt(b.score, MAX_SCORE + 1);
+  if (score > MAX_SCORE) return send(res, 400, { ok: false, error: 'bad_score' }, cors);
+  const t0 = runs.get(b.id);
+  runs.delete(b.id);                                   // 一次开始只能交一次分数
+  if (!t0) return send(res, 200, { ok: false, error: 'no_run' }, cors);
+  const secs = (Date.now() - t0) / 1000;
+  if (score > secs * EARN_MAX_RATE + EARN_SLACK) {
+    console.warn('run implausible', b.id.slice(0, 8), 'score', score, 'secs', secs.toFixed(1));
+    return send(res, 200, { ok: false, error: 'implausible' }, cors);
+  }
+  const [[r]] = await pool.query('SELECT unlocked, all_best, earned FROM players WHERE id = ?', [b.id]);
+  const allBest = Math.max(Number(r.all_best || 0), score);
+  let earned = Number(r.earned || 0);
+  const entitled = Math.min(Math.floor(allBest / EARN_STEP), REDEEMABLE.length);
+  const granted = [];
+  let owned = ownedOf(r.unlocked);
+  while (earned < entitled) {
+    const locked = lockedFor(owned.join(','));
+    earned++;                                          // 即使已经集齐也推进计数，避免以后重复补发
+    if (!locked.length) continue;
+    const pick = locked[crypto.randomInt(locked.length)];
+    granted.push(pick); owned = cleanSkins([...owned, 'player:' + pick]);
+  }
+  await pool.query('UPDATE players SET all_best = ?, earned = ?, unlocked = ? WHERE id = ?', [allBest, earned, owned.join(','), b.id]);
+  send(res, 200, { ok: true, granted, unlocked: owned, ...earnInfo(allBest, earned) }, cors);
+}
+
 async function handleWaStatus(req, res, cors) {
   const b = await chatBody(req, res, cors); if (!b) return;
   const [rows] = await pool.query('SELECT skin FROM wa_leads WHERE pid = ?', [b.id]);
@@ -883,6 +935,10 @@ async function route(req, res) {
   if (req.method === 'POST' && (path === '/api/wa/claim' || path === '/api/wa/status')) {
     if (!allow(clientIp(req) + ':wa', 20)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
     return path.endsWith('claim') ? handleWaClaim(req, res, cors) : handleWaStatus(req, res, cors);
+  }
+  if (req.method === 'POST' && (path === '/api/run/start' || path === '/api/run/finish')) {
+    if (!allow(clientIp(req) + ':run', 90)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
+    return path.endsWith('start') ? handleRunStart(req, res, cors) : handleRunFinish(req, res, cors);
   }
   if (req.method === 'POST' && path === '/api/chat/admin') {
     if (!allow(clientIp(req) + ':chatadm', 20)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
