@@ -9,7 +9,9 @@
 //   POST /api/room/create     同图比赛：开房间（返回 4 位房间码 + 地图种子）
 //   POST /api/room/join       加入房间
 //   POST /api/room/score      交本局成绩（每人每局只收第一次）
-//   POST /api/room/rematch    同一个房间再来一局（换新地图种子，局数 +1）
+//   POST /api/room/rematch    同 /ready（旧版页面兼容）
+//   POST /api/room/ready      本局打完后点“确认下一局”；所有人都打完且都确认才翻到下一局（换新种子，局数 +1）
+//   POST /api/room/leave      离开房间（不再挡着别人开下一局）
 //   GET  /api/room/:code      房间里的玩家和成绩
 //   GET  /api/chat            留言板（聊天大厅）：最新消息；?after=ID 只取更新的
 //   POST /api/chat/send       发消息（必须已登录账号；限频 + 敏感词过滤）
@@ -161,6 +163,13 @@ async function initDb() {
     pid CHAR(32) NOT NULL,
     score INT NOT NULL,
     finished_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (code, rnd, pid)
+  ) DEFAULT CHARSET=utf8mb4`);
+  // 每个房间每一局谁点了“确认下一局”（所有人都打完且都确认才开下一局）
+  await pool.query(`CREATE TABLE IF NOT EXISTS room_ready (
+    code CHAR(4) NOT NULL,
+    rnd INT NOT NULL,
+    pid CHAR(32) NOT NULL,
     PRIMARY KEY (code, rnd, pid)
   ) DEFAULT CHARSET=utf8mb4`);
   // 留言板（聊天大厅）：消息 / 举报 / 禁言
@@ -517,10 +526,10 @@ async function roomView(code) {
   if (!rooms.length) return null;
   const rnd = rooms[0].rnd || 1;
   const [rows] = await pool.query(
-    'SELECT rp.pid, s.score, p.nickname, p.avatar FROM room_players rp LEFT JOIN room_scores s ON s.code = rp.code AND s.pid = rp.pid AND s.rnd = ? LEFT JOIN players p ON p.id = rp.pid WHERE rp.code = ? ORDER BY rp.joined_at ASC, rp.pid ASC', [rnd, code]);
+    'SELECT rp.pid, s.score, rr.pid AS rdy, p.nickname, p.avatar FROM room_players rp LEFT JOIN room_scores s ON s.code = rp.code AND s.pid = rp.pid AND s.rnd = ? LEFT JOIN room_ready rr ON rr.code = rp.code AND rr.pid = rp.pid AND rr.rnd = ? LEFT JOIN players p ON p.id = rp.pid WHERE rp.code = ? ORDER BY rp.joined_at ASC, rp.pid ASC', [rnd, rnd, code]);
   return {
     code, seed: rooms[0].seed, round: rnd,
-    players: rows.map((r) => ({ id: r.pid, nickname: r.nickname || 'Player', score: r.score === null ? null : r.score, ...look(r.pid, r.avatar) })),
+    players: rows.map((r) => ({ id: r.pid, nickname: r.nickname || 'Player', score: r.score === null ? null : r.score, ready: !!r.rdy, ...look(r.pid, r.avatar) })),
   };
 }
 
@@ -535,6 +544,7 @@ async function handleRoomCreate(req, res, cors) {
   const b = await roomBody(req, res, cors); if (!b) return;
   await pool.query('DELETE FROM room_players WHERE code IN (SELECT code FROM rooms WHERE created_at < (NOW() - INTERVAL 1 DAY))').catch(() => {});
   await pool.query('DELETE FROM room_scores WHERE code IN (SELECT code FROM rooms WHERE created_at < (NOW() - INTERVAL 1 DAY))').catch(() => {});
+  await pool.query('DELETE FROM room_ready WHERE code IN (SELECT code FROM rooms WHERE created_at < (NOW() - INTERVAL 1 DAY))').catch(() => {});
   await pool.query('DELETE FROM rooms WHERE created_at < (NOW() - INTERVAL 1 DAY)').catch(() => {});
   const seed = crypto.randomInt(1, 2147483647);
   for (let i = 0; i < 12; i++) {
@@ -581,19 +591,45 @@ async function handleRoomScore(req, res, cors) {
   send(res, 200, { ok: true, room: await roomView(code) }, cors);
 }
 
-async function handleRoomRematch(req, res, cors) {
+// 所有人都打完这一局、并且都点了“确认下一局” → 翻到下一局（换新种子）。UPDATE 带 rnd 条件，重复调用只会翻一次。
+async function roomMaybeAdvance(code, room) {
+  if (!room.players.length) return room;
+  if (!room.players.every((p) => p.score !== null && p.ready)) return room;
+  if (room.round >= 99) return room;
+  await pool.query('UPDATE rooms SET rnd = rnd + 1, seed = ? WHERE code = ? AND rnd = ?', [crypto.randomInt(1, 2147483647), code, room.round]);
+  return await roomView(code);
+}
+
+async function handleRoomReady(req, res, cors) {
+  const b = await roomBody(req, res, cors); if (!b) return;
+  const code = String(b.code || '').toUpperCase();
+  if (!isCode(code)) return send(res, 400, { ok: false, error: 'bad_code' }, cors);
+  let room = await roomView(code);
+  if (!room) return send(res, 404, { ok: false, error: 'no_room' }, cors);
+  const me = room.players.find((p) => p.id === b.id);
+  if (!me) return send(res, 403, { ok: false, error: 'forbidden' }, cors);
+  // 只有“还停在刚打完的那一局”时才登记；别人已经翻篇了就直接返回最新的
+  if (room.round === Math.floor(Number(b.round))) {
+    if (room.round >= 99) return send(res, 409, { ok: false, error: 'max_rounds' }, cors);
+    if (me.score === null) return send(res, 409, { ok: false, error: 'not_finished' }, cors);   // 自己这一局还没结算，不能开新局
+    await pool.query('INSERT IGNORE INTO room_ready (code, rnd, pid) VALUES (?, ?, ?)', [code, room.round, b.id]);
+    room = await roomMaybeAdvance(code, await roomView(code));
+  }
+  send(res, 200, { ok: true, room }, cors);
+}
+
+async function handleRoomLeave(req, res, cors) {
   const b = await roomBody(req, res, cors); if (!b) return;
   const code = String(b.code || '').toUpperCase();
   if (!isCode(code)) return send(res, 400, { ok: false, error: 'bad_code' }, cors);
   const room = await roomView(code);
-  if (!room) return send(res, 404, { ok: false, error: 'no_room' }, cors);
-  if (!room.players.some((p) => p.id === b.id)) return send(res, 403, { ok: false, error: 'forbidden' }, cors);
-  // 只有“还停在刚打完的那一局”时才翻篇；别人已经开了新的一局就直接返回最新的
-  if (room.round === Math.floor(Number(b.round))) {
-    if (room.round >= 99) return send(res, 409, { ok: false, error: 'max_rounds' }, cors);
-    await pool.query('UPDATE rooms SET rnd = rnd + 1, seed = ? WHERE code = ? AND rnd = ?', [crypto.randomInt(1, 2147483647), code, room.round]);
+  if (!room) return send(res, 200, { ok: true }, cors);
+  if (room.players.some((p) => p.id === b.id)) {
+    await pool.query('DELETE FROM room_players WHERE code = ? AND pid = ?', [code, b.id]);
+    await pool.query('DELETE FROM room_ready WHERE code = ? AND pid = ?', [code, b.id]);
+    await roomMaybeAdvance(code, await roomView(code));    // 他是最后一个没确认的人时，其他人不用再等
   }
-  send(res, 200, { ok: true, room: await roomView(code) }, cors);
+  send(res, 200, { ok: true }, cors);
 }
 
 /* ---------- 留言板（聊天大厅） ---------- */
@@ -828,9 +864,9 @@ async function route(req, res) {
     if (!allow(clientIp(req) + ':inv', 40)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
     return path.endsWith('status') ? handleInviteStatus(req, res, cors) : path.endsWith('claim') ? handleInviteClaim(req, res, cors) : handleInviteRedeem(req, res, cors);
   }
-  if (req.method === 'POST' && /^\/api\/room\/(create|join|score|rematch)$/.test(path)) {
+  if (req.method === 'POST' && /^\/api\/room\/(create|join|score|rematch|ready|leave)$/.test(path)) {
     if (!allow(clientIp(req) + ':room', 40)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
-    return path.endsWith('create') ? handleRoomCreate(req, res, cors) : path.endsWith('join') ? handleRoomJoin(req, res, cors) : path.endsWith('rematch') ? handleRoomRematch(req, res, cors) : handleRoomScore(req, res, cors);
+    return path.endsWith('create') ? handleRoomCreate(req, res, cors) : path.endsWith('join') ? handleRoomJoin(req, res, cors) : (path.endsWith('rematch') || path.endsWith('ready')) ? handleRoomReady(req, res, cors) : path.endsWith('leave') ? handleRoomLeave(req, res, cors) : handleRoomScore(req, res, cors);
   }
   if (req.method === 'GET' && path === '/api/chat') {
     if (!allow(clientIp(req) + ':chatget', 90)) return send(res, 429, { ok: false, error: 'too_many_requests' }, cors);
