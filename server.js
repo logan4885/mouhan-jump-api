@@ -424,8 +424,8 @@ async function handleSync(req, res, cors) {
   send(res, 200, { ok: true, week, rank: await rankOf(me.best_score), score: me.best_score, rogueScore: me.rogue_best, rogueRank: me.rogue_best > 0 ? await rogueRankOf(me.rogue_best) : null, avatar: look(b.id, me.avatar).avatar }, cors);
 }
 
-/* ---------- 邀请好友（每 10 个有效邀请 -> 1 个兑换码 -> 随机解锁 1 款特效罐） ---------- */
-const INVITE_STEP = 10;
+/* ---------- 邀请好友（每 3 个有效邀请 -> 1 个兑换码 -> 随机解锁 1 款特效罐） ---------- */
+const INVITE_STEP = 3;
 const REDEEMABLE = CAN_IDS.filter((i) => !FREE_CANS.includes(i));
 const INV_ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const randStr = (n) => Array.from({ length: n }, () => INV_ALPHA[crypto.randomInt(INV_ALPHA.length)]).join('');
