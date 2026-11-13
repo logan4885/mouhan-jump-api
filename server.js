@@ -16,7 +16,7 @@
 //   GET  /api/chat            留言板（聊天大厅）：最新消息；?after=ID 只取更新的
 //   POST /api/chat/send       发消息（必须已登录账号；限频 + 敏感词过滤）
 //   POST /api/chat/report     举报某条消息（3 个不同的人举报会自动隐藏）
-//   POST /api/chat/admin      管理员（需 CHAT_ADMIN_KEY）：list / delete / restore / ban / unban / bans；wa_list / wa_mark / wa_delete（WhatsApp 名单）；player_search / player_detail（玩家查询）
+//   POST /api/chat/admin      管理员（需 CHAT_ADMIN_KEY）：list / delete / restore / ban / unban / bans；wa_list / wa_mark / wa_delete（WhatsApp 名单）；player_search / player_detail（玩家查询）/ grant_skin（补发罐子）
 //   POST /api/wa/claim        填 WhatsApp 号码（需登录 + 同意联系）领 1 款随机皮肤；每账号 / 每号码只能领一次
 //   POST /api/wa/status       我有没有领过
 //   POST /api/run/start       普通模式开一局：服务器记下开始时间，返回我的“靠分数解锁”进度
@@ -809,6 +809,18 @@ async function handleChatAdmin(req, res, cors) {
         chat: { total: Number(msgs.total), hidden: Number(msgs.hidden), recent: recent.map((m) => ({ id: Number(m.id), text: m.text, hidden: !!m.hidden, ts: Number(m.ts) })) },
         ban: ban ? { reason: ban.reason, until: ban.until_ts ? Number(ban.until_ts) : null } : null,
         invited: Number(inv.c), invitedBy: by ? by.inviter_id : '' } }, cors);
+    }
+    case 'grant_skin': {         // 手动补发 1 款特效罐（不指定 skin 就随机发 1 款还没有的）
+      if (!isHex32(b.pid)) return send(res, 400, { ok: false, error: 'bad_pid' }, cors);
+      const [pr] = await pool.query('SELECT unlocked FROM players WHERE id = ?', [b.pid]);
+      if (!pr.length) return send(res, 404, { ok: false, error: 'not_found' }, cors);
+      const locked = lockedFor(pr[0].unlocked);
+      if (!locked.length) return send(res, 400, { ok: false, error: 'none' }, cors);        // 罐子已集齐
+      const pick = locked.includes(b.skin) ? b.skin : locked[crypto.randomInt(locked.length)];
+      const merged = cleanSkins([...ownedOf(pr[0].unlocked), 'player:' + pick]);
+      await pool.query('UPDATE players SET unlocked = ? WHERE id = ?', [merged.join(','), b.pid]);
+      console.log('[admin] grant_skin', b.pid.slice(0, 8), pick);
+      return send(res, 200, { ok: true, skin: pick }, cors);
     }
     default: return send(res, 400, { ok: false, error: 'bad_action' }, cors);
   }
