@@ -16,7 +16,7 @@
 //   GET  /api/chat            留言板（聊天大厅）：最新消息；?after=ID 只取更新的
 //   POST /api/chat/send       发消息（必须已登录账号；限频 + 敏感词过滤）
 //   POST /api/chat/report     举报某条消息（3 个不同的人举报会自动隐藏）
-//   POST /api/chat/admin      管理员（需 CHAT_ADMIN_KEY）：list / delete / restore / ban / unban / bans；wa_list / wa_mark / wa_delete（WhatsApp 名单）
+//   POST /api/chat/admin      管理员（需 CHAT_ADMIN_KEY）：list / delete / restore / ban / unban / bans；wa_list / wa_mark / wa_delete（WhatsApp 名单）；player_search / player_detail（玩家查询）
 //   POST /api/wa/claim        填 WhatsApp 号码（需登录 + 同意联系）领 1 款随机皮肤；每账号 / 每号码只能领一次
 //   POST /api/wa/status       我有没有领过
 //   POST /api/run/start       普通模式开一局：服务器记下开始时间，返回我的“靠分数解锁”进度
@@ -771,6 +771,45 @@ async function handleChatAdmin(req, res, cors) {
       return send(res, 200, { ok: true }, cors);
     }
     case 'wa_delete': await pool.query('DELETE FROM wa_leads WHERE id = ?', [Math.floor(Number(b.wid)) || 0]); return send(res, 200, { ok: true }, cors);
+    case 'player_search': {      // 玩家查询：按昵称 / 玩家 ID（前缀）/ WhatsApp 号码 模糊查，最多 50 条
+      const q = String(b.q || '').trim().slice(0, 40);
+      if (!q) return send(res, 400, { ok: false, error: 'empty_query' }, cors);
+      const esc = q.replace(/[\\%_]/g, '\\$&');
+      const digits = q.replace(/\D/g, '');
+      const idq = /^[0-9a-f]{4,32}$/i.test(q) ? q.toLowerCase() : '';
+      const [rows] = await pool.query(`SELECT p.id, p.nickname, p.avatar, p.best_score, p.rogue_best, p.all_best, p.games, p.equipped,
+          UNIX_TIMESTAMP(p.created_at) AS created, UNIX_TIMESTAMP(p.updated_at) AS updated,
+          (SELECT GROUP_CONCAT(a.provider) FROM accounts a WHERE a.player_id = p.id) AS providers,
+          (SELECT w.phone FROM wa_leads w WHERE w.pid = p.id LIMIT 1) AS phone
+        FROM players p
+        WHERE p.nickname LIKE ?
+           OR (? <> '' AND p.id LIKE ?)
+           OR (? <> '' AND EXISTS (SELECT 1 FROM wa_leads w2 WHERE w2.pid = p.id AND w2.phone LIKE ?))
+        ORDER BY p.updated_at DESC LIMIT 50`,
+        ['%' + esc + '%', idq, idq + '%', digits.length >= 4 ? digits : '', '%' + digits + '%']);
+      return send(res, 200, { ok: true, players: rows.map((r) => ({ id: r.id, nick: r.nickname, avatar: r.avatar || '', best: Number(r.best_score), rogue: Number(r.rogue_best || 0),
+        allBest: Number(r.all_best || 0), games: Number(r.games), equipped: r.equipped, created: Number(r.created), updated: Number(r.updated), providers: r.providers || '', phone: r.phone || '' })) }, cors);
+    }
+    case 'player_detail': {      // 单个玩家的完整资料：成绩、皮肤、登录方式、WhatsApp、留言和封禁、邀请
+      if (!isHex32(b.pid)) return send(res, 400, { ok: false, error: 'bad_pid' }, cors);
+      const [[p]] = await pool.query('SELECT *, UNIX_TIMESTAMP(created_at) AS created, UNIX_TIMESTAMP(updated_at) AS updated FROM players WHERE id = ?', [b.pid]);
+      if (!p) return send(res, 404, { ok: false, error: 'not_found' }, cors);
+      const [accs] = await pool.query('SELECT provider, UNIX_TIMESTAMP(created_at) AS ts FROM accounts WHERE player_id = ?', [b.pid]);
+      const [[wa]] = await pool.query('SELECT phone, cc, skin, verified, note, UNIX_TIMESTAMP(created_at) AS ts FROM wa_leads WHERE pid = ?', [b.pid]).then((r) => [[r[0][0]]]);
+      const [[msgs]] = await pool.query('SELECT COUNT(*) AS total, COALESCE(SUM(hidden), 0) AS hidden FROM chat_msgs WHERE pid = ?', [b.pid]);
+      const [recent] = await pool.query('SELECT id, text, hidden, UNIX_TIMESTAMP(created_at) AS ts FROM chat_msgs WHERE pid = ? ORDER BY id DESC LIMIT 10', [b.pid]);
+      const [[ban]] = await pool.query('SELECT reason, UNIX_TIMESTAMP(until_at) AS until_ts FROM chat_bans WHERE pid = ? AND (until_at IS NULL OR until_at > NOW())', [b.pid]).then((r) => [[r[0][0]]]);
+      const [[inv]] = await pool.query('SELECT COUNT(*) AS c FROM referrals WHERE inviter_id = ?', [b.pid]);
+      const [[by]] = await pool.query('SELECT inviter_id FROM referrals WHERE invitee_id = ?', [b.pid]).then((r) => [[r[0][0]]]);
+      return send(res, 200, { ok: true, player: {
+        id: p.id, nick: p.nickname, avatar: p.avatar || '', best: Number(p.best_score), rogue: Number(p.rogue_best || 0), allBest: Number(p.all_best || 0), earned: Number(p.earned || 0),
+        perfects: Number(p.perfects), games: Number(p.games), equipped: p.equipped, unlocked: ownedOf(p.unlocked), created: Number(p.created), updated: Number(p.updated),
+        accounts: accs.map((a) => ({ provider: a.provider, ts: Number(a.ts) })),
+        wa: wa ? { phone: wa.phone, cc: wa.cc, skin: wa.skin, verified: !!wa.verified, note: wa.note, ts: Number(wa.ts) } : null,
+        chat: { total: Number(msgs.total), hidden: Number(msgs.hidden), recent: recent.map((m) => ({ id: Number(m.id), text: m.text, hidden: !!m.hidden, ts: Number(m.ts) })) },
+        ban: ban ? { reason: ban.reason, until: ban.until_ts ? Number(ban.until_ts) : null } : null,
+        invited: Number(inv.c), invitedBy: by ? by.inviter_id : '' } }, cors);
+    }
     default: return send(res, 400, { ok: false, error: 'bad_action' }, cors);
   }
 }
